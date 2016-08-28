@@ -5,7 +5,7 @@ use collections::string::String;
 
 use core::cmp;
 
-use fs::{KScheme, Resource, Url};
+use fs::{KScheme, Resource};
 
 use system::error::Result;
 
@@ -35,7 +35,7 @@ impl Resource for DebugResource {
 
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         if self.command.is_empty() {
-            self.command = ::env().console.lock().commands.receive();
+            self.command = unsafe { &mut *::env().console.get() }.commands.receive("DebugResource::read");
         }
 
         let mut i = 0;
@@ -48,13 +48,15 @@ impl Resource for DebugResource {
     }
 
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        ::env().console.lock().write(buf);
+        unsafe { &mut *::env().console.get() }.write(buf);
         Ok(buf.len())
     }
 
     fn sync(&mut self) -> Result<()> {
-        let mut console = ::env().console.lock();
-        console.redraw = true;
+        let console = unsafe { &mut *::env().console.get() };
+        if let Some(ref mut inner) = console.inner {
+            inner.redraw = true;
+        }
         console.write(&[]);
         Ok(())
     }
@@ -73,8 +75,8 @@ impl KScheme for DebugScheme {
         "debug"
     }
 
-    fn open(&mut self, _: Url, _: usize) -> Result<Box<Resource>> {
-        let console = ::env().console.lock();
+    fn open(&mut self, _: &str, _: usize) -> Result<Box<Resource>> {
+        let console = unsafe { & *::env().console.get() };
         if let Some(ref display) = console.display {
             Ok(box DebugResource {
                 path: format!("debug:{}/{}", display.width/8, display.height/16),

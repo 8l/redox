@@ -1,4 +1,3 @@
-use common::debug;
 use common::slice::GetSlice;
 
 use collections::vec::Vec;
@@ -9,7 +8,9 @@ use arch::context::context_switch;
 
 use network::common::*;
 
-use fs::{KScheme, Url};
+use fs::KScheme;
+
+use system::syscall::O_RDWR;
 
 #[derive(Copy, Clone)]
 #[repr(packed)]
@@ -31,7 +32,7 @@ pub struct Arp {
 }
 
 impl FromBytes for Arp {
-    fn from_bytes(bytes: Vec<u8>) -> Option<Self> {
+    fn from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() >= mem::size_of::<ArpHeader>() {
             unsafe {
                 return Some(Arp {
@@ -66,12 +67,12 @@ impl KScheme for ArpScheme {
 
 impl ArpScheme {
     pub fn reply_loop() {
-        while let Ok(mut link) = Url::from_str("ethernet:/806").unwrap().open() {
+        while let Ok(mut link) = ::env().open("ethernet:/806", O_RDWR) {
             loop {
-                let mut bytes = [0; 8192];
+                let mut bytes = [0; 65536];
                 if let Ok(count) = link.read(&mut bytes) {
-                    if let Some(packet) = Arp::from_bytes(bytes[.. count].to_vec()) {
-                        if packet.header.oper.get() == 1 && packet.header.dst_ip.equals(IP_ADDR) {
+                    if let Some(packet) = Arp::from_bytes(&bytes[..count]) {
+                        if packet.header.oper.get() == 1 && packet.header.dst_ip.equals(unsafe { IP_ADDR }) {
                             let mut response = Arp {
                                 header: packet.header,
                                 data: packet.data.clone(),
@@ -80,7 +81,7 @@ impl ArpScheme {
                             response.header.dst_mac = packet.header.src_mac;
                             response.header.dst_ip = packet.header.src_ip;
                             response.header.src_mac = unsafe { MAC_ADDR };
-                            response.header.src_ip = IP_ADDR;
+                            response.header.src_ip =unsafe { IP_ADDR };
 
                             let _ = link.write(&response.to_bytes());
                         }
@@ -91,6 +92,6 @@ impl ArpScheme {
             }
             unsafe { context_switch() };
         }
-        debug::d("ARP: Failed to open ethernet:\n");
+        debug!("ARP: Failed to open ethernet:\n");
     }
 }

@@ -1,5 +1,7 @@
 use alloc::boxed::Box;
 
+use collections::String;
+
 use core::cmp;
 
 use common::event::{KeyEvent, MouseEvent};
@@ -47,14 +49,16 @@ pub struct Ps2 {
     sts: ReadOnly<Pio<u8>>,
     /// The command register
     cmd: WriteOnly<Pio<u8>>,
-    /// Left shift?
+    /// Left shift
     lshift: bool,
-    /// Right shift?
+    /// Right shift
     rshift: bool,
-    /// Caps lock?
+    /// Caps lock
     caps_lock: bool,
     /// Caps lock toggle
     caps_lock_toggle: bool,
+    /// Left control
+    lctrl: bool,
     /// AltGr?
     altgr: bool,
     /// The mouse packet
@@ -81,6 +85,7 @@ impl Ps2 {
             rshift: false,
             caps_lock: false,
             caps_lock_toggle: false,
+            lctrl: false,
             altgr: false,
             mouse_packet: [0; 4],
             mouse_i: 0,
@@ -136,78 +141,78 @@ impl Ps2 {
             self.data.read();
         }
 
-        debugln!(" + PS/2");
+        syslog_info!(" + PS/2");
 
         // No interrupts, system flag set, clocks enabled, translation enabled
         self.write(0x60, 0b01000100);
 
         while self.sts.readf(1) {
-            debugln!("Extra {}: {:X}", line!(), self.data.read());
+            syslog_info!("   - Extra {}: {:X}", line!(), self.data.read());
         }
 
         // Enable First Port
-        debugln!("   + Keyboard");
+        syslog_info!("   + PS/2 Keyboard");
         self.cmd(0xAE);
 
         while self.sts.readf(1) {
-            debugln!("Extra {}: {:X}", line!(), self.data.read());
+            syslog_info!("     - Extra {}: {:X}", line!(), self.data.read());
         }
 
         {
             // Reset
-            debug!("     - Reset {:X}", self.keyboard().cmd(0xFF));
+            self.keyboard().cmd(0xFF);
             self.wait_read();
-            debugln!(", {:X}", self.data.read());
+            self.data.read();
 
             while self.sts.readf(1) {
-                debugln!("Extra {}: {:X}", line!(), self.data.read());
+                syslog_info!("     - Extra {}: {:X}", line!(), self.data.read());
             }
 
             // Set defaults
-            debugln!("     - Set defaults {:X}", self.keyboard().cmd(0xF6));
+            self.keyboard().cmd(0xF6);
 
             while self.sts.readf(1) {
-                debugln!("Extra {}: {:X}", line!(), self.data.read());
+                syslog_info!("     - Extra {}: {:X}", line!(), self.data.read());
             }
 
             // Enable Streaming
-            debugln!("     - Enable streaming {:X}", self.keyboard().cmd(0xF4));
+            self.keyboard().cmd(0xF4);
 
             while self.sts.readf(1) {
-                debugln!("Extra {}: {:X}", line!(), self.data.read());
+                syslog_info!("     - Extra {}: {:X}", line!(), self.data.read());
             }
         }
 
         // Enable Second Port
-        debugln!("   + PS/2 Mouse");
+        syslog_info!("   + PS/2 Mouse");
         self.cmd(0xA8);
 
         while self.sts.readf(1) {
-            debugln!("Extra {}: {:X}", line!(), self.data.read());
+            syslog_info!("     - Extra {}: {:X}", line!(), self.data.read());
         }
 
         {
             // Reset
-            debug!("     - Reset {:X}", self.keyboard().cmd(0xFF));
+            self.keyboard().cmd(0xFF);
             self.wait_read();
-            debugln!(", {:X}", self.data.read());
+            self.data.read();
 
             while self.sts.readf(1) {
-                debugln!("Extra {}: {:X}", line!(), self.data.read());
+                syslog_info!("     - Extra {}: {:X}", line!(), self.data.read());
             }
 
             // Set defaults
-            debugln!("     - Set defaults {:X}", self.mouse().cmd(0xF6));
+            self.mouse().cmd(0xF6);
 
             while self.sts.readf(1) {
-                debugln!("Extra {}: {:X}", line!(), self.data.read());
+                syslog_info!("     - Extra {}: {:X}", line!(), self.data.read());
             }
 
             // Enable Streaming
-            debugln!("     - Enable streaming {:X}", self.mouse().cmd(0xF4));
+            self.mouse().cmd(0xF4);
 
             while self.sts.readf(1) {
-                debugln!("Extra {}: {:X}", line!(), self.data.read());
+                syslog_info!("     - Extra {}: {:X}", line!(), self.data.read());
             }
         }
 
@@ -215,7 +220,7 @@ impl Ps2 {
         self.write(0x60, 0b01000111);
 
         while self.sts.readf(1) {
-            debugln!("Extra {}: {:X}", line!(), self.data.read());
+            syslog_info!("     - Extra {}: {:X}", line!(), self.data.read());
         }
     }
 
@@ -242,6 +247,10 @@ impl Ps2 {
             if self.caps_lock && !self.caps_lock_toggle {
                 self.caps_lock = false;
             }
+        } else if scancode == 0x1D {
+            self.lctrl = true;
+        } else if scancode == 0x9D {
+            self.lctrl = false;
         } else if scancode == 0xE0 {
             let scancode_byte_2 = self.data.read();
             if scancode_byte_2 == 0x38 {
@@ -253,13 +262,57 @@ impl Ps2 {
             }
         }
 
+        if self.lctrl {
+            if scancode == 0x2E {
+                let console = unsafe { &mut *::env().console.get() };
+
+                console.write(b"^C\n");
+                console.commands.send(String::new(), "Serial Control C");
+
+                if let Some(ref mut inner) = console.inner {
+                    inner.redraw = true;
+                }
+                console.write(b"");
+
+                return None;
+            } else if scancode == 0x20 {
+                let console = unsafe { &mut *::env().console.get() };
+
+                console.write(b"^D\n");
+
+                {
+                    let contexts = unsafe { &mut *::env().contexts.get() };
+                    debugln!("Magic CTRL-D {}", ::common::time::Duration::monotonic().secs);
+                    for context in contexts.iter() {
+                        debugln!("  PID {}: {}", context.pid, context.name);
+
+                        if context.blocked > 0 {
+                            debugln!("    BLOCKED {}", context.blocked);
+                        }
+
+                        if let Some(current_syscall) = context.current_syscall {
+                            debugln!("    SYS {:X}: {} {} {:X} {:X} {:X}", current_syscall.0, current_syscall.1, ::syscall::name(current_syscall.1), current_syscall.2, current_syscall.3, current_syscall.4);
+                        }
+                    }
+                }
+
+                if let Some(ref mut inner) = console.inner {
+                    inner.redraw = true;
+                }
+                console.write(b"");
+
+                return None;
+            }
+        }
+
         let shift = self.caps_lock != (self.lshift || self.rshift);
 
-        return Some(KeyEvent {
+
+        Some(KeyEvent {
             character: layouts::char_for_scancode(scancode & 0x7F, shift, self.altgr, &self.layout),
             scancode: scancode & 0x7F,
             pressed: scancode < 0x80,
-        });
+        })
     }
 
     /// Mouse interrupt
@@ -334,19 +387,19 @@ impl KScheme for Ps2 {
                 if status & 0x21 == 0x21 {
                     let data = self.data.read();
                     if let Some(mouse_event) = self.mouse_interrupt(data) {
-                        if ::env().console.lock().draw {
+                        if unsafe { & *::env().console.get() }.draw {
                             //Ignore mouse event
                         } else {
-                            ::env().events.send(mouse_event.to_event());
+                            ::env().events.send(mouse_event.to_event(), "Ps2::on_irq mouse");
                         }
                     }
                 } else if status & 0x21 == 0x01 {
                     let data = self.data.read();
                     if let Some(key_event) = self.keyboard_interrupt(data) {
-                        if ::env().console.lock().draw {
-                            ::env().console.lock().event(key_event.to_event());
+                        if unsafe { & *::env().console.get() }.draw {
+                            unsafe { &mut *::env().console.get() }.event(key_event.to_event());
                         } else {
-                            ::env().events.send(key_event.to_event());
+                            ::env().events.send(key_event.to_event(), "Ps2::on_irq key");
                         }
                     }
                 } else {

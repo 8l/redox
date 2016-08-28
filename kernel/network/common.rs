@@ -3,8 +3,16 @@ use collections::vec::Vec;
 
 use common::to_num::ToNum;
 
+pub static mut DNS_ADDR: Ipv4Addr = Ipv4Addr { bytes: [10, 85, 85, 1] };
+pub static BROADCAST_IP_ADDR: Ipv4Addr = Ipv4Addr { bytes: [255, 255, 255, 255] };
+pub static mut IP_ADDR: Ipv4Addr = Ipv4Addr { bytes: [10, 85, 85, 2] };
+pub static mut IP_ROUTER_ADDR: Ipv4Addr = Ipv4Addr { bytes: [10, 85, 85, 1] };
+pub static mut IP_SUBNET: Ipv4Addr = Ipv4Addr { bytes: [255, 255, 255, 0] };
+pub static BROADCAST_MAC_ADDR: MacAddr = MacAddr { bytes: [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF] };
+pub static mut MAC_ADDR: MacAddr = MacAddr { bytes: [0x00, 0x00, 0x00, 0x00, 0x00, 0x00] };
+
 pub trait FromBytes {
-    fn from_bytes(bytes: Vec<u8>) -> Option<Self> where Self: Sized;
+    fn from_bytes(bytes: &[u8]) -> Option<Self> where Self: Sized;
 }
 
 pub trait ToBytes {
@@ -104,10 +112,6 @@ impl MacAddr {
     }
 }
 
-pub static BROADCAST_MAC_ADDR: MacAddr = MacAddr { bytes: [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF] };
-
-pub static mut MAC_ADDR: MacAddr = MacAddr { bytes: [0x00, 0x00, 0x00, 0x00, 0x00, 0x00] };
-
 #[derive(Copy, Clone)]
 pub struct Ipv4Addr {
     pub bytes: [u8; 4],
@@ -123,7 +127,7 @@ impl Ipv4Addr {
         true
     }
 
-    pub fn from_string(string: &String) -> Self {
+    pub fn from_str(string: &str) -> Self {
         let mut addr = Ipv4Addr { bytes: [0, 0, 0, 0] };
 
         let mut i = 0;
@@ -176,10 +180,6 @@ impl Ipv6Addr {
     }
 }
 
-pub static BROADCAST_IP_ADDR: Ipv4Addr = Ipv4Addr { bytes: [10, 85, 85, 255] };
-
-pub static IP_ADDR: Ipv4Addr = Ipv4Addr { bytes: [10, 85, 85, 2] };
-
 #[derive(Copy, Clone)]
 pub struct Checksum {
     pub data: u16,
@@ -229,7 +229,7 @@ impl Checksum {
         sum
     }
 
-    pub unsafe fn compile(mut sum: usize) -> u16 {
+    pub fn compile(mut sum: usize) -> u16 {
         while (sum >> 16) > 0 {
             sum = (sum & 0xFFFF) + (sum >> 16);
         }

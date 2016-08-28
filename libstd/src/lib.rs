@@ -25,6 +25,7 @@
 #![feature(heap_api)]
 #![feature(int_error_internals)]
 #![feature(lang_items)]
+#![feature(linkage)]
 #![feature(macro_reexport)]
 #![feature(naked_functions)]
 #![feature(oom)]
@@ -36,7 +37,6 @@
 #![feature(slice_concat_ext)]
 #![feature(slice_patterns)]
 #![feature(stmt_expr_attributes)]
-#![feature(str_char)]
 #![feature(type_ascription)]
 #![feature(unicode)]
 #![feature(unique)]
@@ -48,19 +48,11 @@
 //#![deny(missing_docs)]
 #![deny(warnings)]
 
-/*TODO
+// Bring in memcpy, memcmp, memmove, memset
+pub mod externs;
+pub use externs::*;
+
 extern crate ralloc;
-
-#[link(name = "c", kind = "static")]
-extern {
-    fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8;
-    fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mut u8;
-    fn memset(s: *mut u8, c: i32, n: usize) -> *mut u8;
-    fn memcmp(s1: *const u8, s2: *const u8, n: usize) -> i32;
-}
-*/
-
-extern crate alloc_malloc;
 
 // STD COPY {
 // We want to reexport a few macros from core but libcore has already been

@@ -3,27 +3,31 @@ use common::slice::GetSlice;
 use alloc::arc::Arc;
 use alloc::boxed::{Box, FnBox};
 
+use arch::gdt::GDT_USER_TLS;
 use arch::memory;
 use arch::paging::Page;
 use arch::regs::Regs;
 
+use collections::borrow::Cow;
 use collections::string::{String, ToString};
 use collections::vec::Vec;
 
 use common::time::Duration;
 
 use core::cell::UnsafeCell;
-use core::slice::{Iter, IterMut};
+use core::slice::{self, Iter, IterMut};
 use core::{mem, ptr};
 use core::ops::DerefMut;
 
 use fs::Resource;
 
-use syscall::{do_sys_exit, CLONE_FILES, CLONE_FS, CLONE_VM, CLONE_VFORK, CLONE_SUPERVISE};
+use syscall;
 
 use system::error::{Error, Result, EBADF, EFAULT, ENOMEM, ESRCH, ENOENT, EINVAL};
 
 use sync::WaitMap;
+
+pub const CONTEXT_FX_SIZE: usize = memory::CLUSTER_SIZE;
 
 pub const CONTEXT_IMAGE_ADDR: usize = 0x8048000;
 pub const CONTEXT_IMAGE_SIZE: usize = 0x10000000;
@@ -36,6 +40,8 @@ pub const CONTEXT_MMAP_SIZE: usize = 0x20000000;
 
 pub const CONTEXT_STACK_ADDR: usize = CONTEXT_MMAP_ADDR + CONTEXT_MMAP_SIZE + memory::CLUSTER_SIZE;
 pub const CONTEXT_STACK_SIZE: usize = 0x100000;
+
+pub const CONTEXT_TLS_ADDR: usize = CONTEXT_STACK_ADDR + CONTEXT_STACK_SIZE + memory::CLUSTER_SIZE;
 
 pub struct ContextManager {
     pub inner: Vec<Box<Context>>,
@@ -109,26 +115,20 @@ impl ContextManager {
 
     pub unsafe fn clean(&mut self) {
         loop {
-            if self.i >= self.len() {
+            while self.i >= self.len() {
                 self.i -= self.len();
             }
 
-            let mut remove = false;
-            if let Ok(next) = self.current() {
-                if next.exited {
-                    remove = true;
-                }
-            }
+            let remove = self.current().map(|next| next.exited).unwrap_or(false);
 
             if remove {
-                let i = self.i;
-                drop(self.inner.remove(i));
+                self.inner.remove(self.i);
             } else {
                 break;
             }
         }
 
-        if self.i >= self.len() {
+        while self.i >= self.len() {
             self.i -= self.len();
         }
     }
@@ -142,18 +142,18 @@ pub unsafe fn context_switch() {
     let mut next_ptr: *mut Context = 0 as *mut Context;
 
     {
-        let mut contexts = ::env().contexts.lock();
+        let contexts = &mut *::env().contexts.get();
         if contexts.enabled {
             let current_i = contexts.i;
             'searching: loop {
                 contexts.i += 1;
                 contexts.clean();
                 if let Ok(mut next) = contexts.current_mut() {
-                    if next.blocked {
+                    if next.blocked > 0 {
                         if let Some(wake) = next.wake {
                             if wake <= Duration::monotonic() {
-                                next.blocked = false;
                                 next.wake = None;
+                                next.unblock("context_switch wake");
                                 break 'searching;
                             }
                         }
@@ -184,6 +184,14 @@ pub unsafe fn context_switch() {
                         }
                     }
 
+                    if let Some(ref mut gdt) = ::GDT_PTR {
+                        if let Some(ref tls) = next.tls {
+                            gdt[GDT_USER_TLS].set_base(tls.virtual_address);
+                        } else {
+                            gdt[GDT_USER_TLS].set_base(0);
+                        }
+                    }
+
                     next.map();
 
                     next_ptr = next.deref_mut();
@@ -198,11 +206,12 @@ pub unsafe fn context_switch() {
 }
 
 pub unsafe fn context_clone(regs: &Regs) -> Result<usize> {
-    let mut contexts = ::env().contexts.lock();
+    let contexts = &mut *::env().contexts.get();
     let flags = regs.bx;
 
-    let kernel_stack = memory::alloc(CONTEXT_STACK_SIZE + 512);
-    if kernel_stack > 0 {
+    let kernel_stack = memory::alloc(CONTEXT_STACK_SIZE);
+    let fx = memory::alloc(CONTEXT_FX_SIZE);
+    if kernel_stack > 0 && fx > 0 {
         let clone_pid = Context::next_pid();
 
         let context = {
@@ -224,38 +233,34 @@ pub unsafe fn context_clone(regs: &Regs) -> Result<usize> {
             let mut kernel_regs = parent.regs;
             kernel_regs.sp = child_regs_addr - extra_size;
 
-            let fx = kernel_stack + CONTEXT_STACK_SIZE;
-            ::memcpy(fx as *mut u8, parent.fx as *const u8, 512);
+            memory::copy_pages(fx as *mut u8, parent.fx as *const u8, CONTEXT_FX_SIZE);
 
-            box Context {
-                pid: clone_pid,
-                ppid: parent.pid,
-                name: parent.name.clone(),
-                iopl: parent.iopl,
-                blocked: false,
-                exited: false,
-                switch: 0,
-                time: 0,
-                vfork: if flags & CLONE_VFORK == CLONE_VFORK {
-                    parent.blocked = true;
-                    Some(parent.deref_mut())
+            let stack = if let Some(ref entry) = parent.stack {
+                let physical_address = memory::alloc(entry.virtual_size);
+                if physical_address > 0 {
+                    memory::copy_pages(physical_address as *mut u8, entry.physical_address as *const u8, entry.virtual_size);
+
+                    Some(ContextMemory {
+                        physical_address: physical_address,
+                        virtual_address: entry.virtual_address,
+                        virtual_size: entry.virtual_size,
+                        writeable: entry.writeable,
+                        allocated: true,
+                    })
                 } else {
                     None
-                },
-                wake: None,
+                }
+            } else {
+                None
+            };
 
-                supervised: flags & CLONE_SUPERVISE == CLONE_SUPERVISE,
-                blocked_syscall: false,
-
-                kernel_stack: kernel_stack,
-                regs: kernel_regs,
-                fx: fx,
-                stack: if let Some(ref entry) = parent.stack {
+            let tls = if let Some(ref entry) = parent.tls {
+                if let Some(ref tls_master) = *parent.tls_master.get() {
                     let physical_address = memory::alloc(entry.virtual_size);
                     if physical_address > 0 {
-                        ::memcpy(physical_address as *mut u8,
-                                 entry.physical_address as *const u8,
-                                 entry.virtual_size);
+                        memory::copy_pages(physical_address as *mut u8, entry.physical_address as *const u8, entry.virtual_size - tls_master.virtual_size);
+                        memory::copy_pages((physical_address + entry.virtual_size - tls_master.virtual_size) as *mut u8, tls_master.physical_address as *const u8, tls_master.virtual_size);
+
                         Some(ContextMemory {
                             physical_address: physical_address,
                             virtual_address: entry.virtual_address,
@@ -268,61 +273,113 @@ pub unsafe fn context_clone(regs: &Regs) -> Result<usize> {
                     }
                 } else {
                     None
-                },
+                }
+            } else {
+                None
+            };
+
+            let image = if flags & syscall::CLONE_VM == syscall::CLONE_VM {
+                //debugln!("{}: {}: clone memory for {}", parent.pid, parent.name, clone_pid);
+
+                parent.image.clone()
+            } else {
+                Arc::new(UnsafeCell::new((*parent.image.get()).dup()))
+            };
+
+            let heap = if flags & syscall::CLONE_VM == syscall::CLONE_VM {
+                //debugln!("{}: {}: clone memory for {}", parent.pid, parent.name, clone_pid);
+
+                parent.heap.clone()
+            } else {
+                Arc::new(UnsafeCell::new((*parent.heap.get()).dup()))
+            };
+
+            let mmap = if flags & syscall::CLONE_VM == syscall::CLONE_VM {
+                //debugln!("{}: {}: clone memory for {}", parent.pid, parent.name, clone_pid);
+
+                parent.mmap.clone()
+            } else {
+                Arc::new(UnsafeCell::new((*parent.mmap.get()).dup()))
+            };
+
+            let tls_master = if flags & syscall::CLONE_VM == syscall::CLONE_VM {
+                parent.tls_master.clone()
+            } else {
+                Arc::new(UnsafeCell::new(None))
+            };
+
+            let env_vars = if flags & syscall::CLONE_VM == syscall::CLONE_VM {
+                parent.env_vars.clone()
+            } else {
+                Arc::new(UnsafeCell::new((*parent.env_vars.get()).clone()))
+            };
+
+            let cwd = if flags & syscall::CLONE_FS == syscall::CLONE_FS {
+                parent.cwd.clone()
+            } else {
+                Arc::new(UnsafeCell::new((*parent.cwd.get()).clone()))
+            };
+
+            let files = if flags & syscall::CLONE_FILES == syscall::CLONE_FILES {
+                //debugln!("{}: {}: clone resources for {}", parent.pid, parent.name, clone_pid);
+
+                parent.files.clone()
+            } else {
+                let files: Vec<ContextFile> = (*parent.files.get())
+                    .iter()
+                    .filter_map(|file| {
+                        if let Ok(resource) = file.resource.dup() {
+                            Some(ContextFile {
+                                fd: file.fd,
+                                resource: resource,
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                Arc::new(UnsafeCell::new(files))
+            };
+
+            // Must be last, so blocking does not cause a deadlock
+            let vfork = if flags & syscall::CLONE_VFORK == syscall::CLONE_VFORK {
+                parent.block("context_clone vfork");
+                Some(parent.deref_mut() as *mut Context)
+            } else {
+                None
+            };
+
+            box Context {
+                pid: clone_pid,
+                ppid: parent.pid,
+                name: parent.name.clone(),
+                iopl: parent.iopl,
+                blocked: 0,
+                exited: false,
+                switch: 0,
+                time: 0,
+                vfork: vfork,
+                wake: None,
+
+                supervised: flags & syscall::CLONE_SUPERVISE == syscall::CLONE_SUPERVISE,
+                blocked_syscall: false,
+                current_syscall: None,
+
+                kernel_stack: kernel_stack,
+                regs: kernel_regs,
+                fx: fx,
+                stack: stack,
+                tls: tls,
                 loadable: parent.loadable,
 
-                image: if flags & CLONE_VM == CLONE_VM {
-                    //debugln!("{}: {}: clone memory for {}", parent.pid, parent.name, clone_pid);
+                image: image,
+                heap: heap,
+                mmap: mmap,
+                tls_master: tls_master,
+                env_vars: env_vars,
 
-                    parent.image.clone()
-                } else {
-                    Arc::new(UnsafeCell::new((*parent.image.get()).dup()))
-                },
-                heap: if flags & CLONE_VM == CLONE_VM {
-                    //debugln!("{}: {}: clone memory for {}", parent.pid, parent.name, clone_pid);
-
-                    parent.heap.clone()
-                } else {
-                    Arc::new(UnsafeCell::new((*parent.heap.get()).dup()))
-                },
-                mmap: if flags & CLONE_VM == CLONE_VM {
-                    //debugln!("{}: {}: clone memory for {}", parent.pid, parent.name, clone_pid);
-
-                    parent.mmap.clone()
-                } else {
-                    Arc::new(UnsafeCell::new((*parent.mmap.get()).dup()))
-                },
-                env_vars: if flags & CLONE_VM == CLONE_VM {  // is CLONE_VM the good flag ?
-                    parent.env_vars.clone()
-                } else {
-                    Arc::new(UnsafeCell::new((*parent.env_vars.get()).clone()))
-                },
-                cwd: if flags & CLONE_FS == CLONE_FS {
-                    parent.cwd.clone()
-                } else {
-                    Arc::new(UnsafeCell::new((*parent.cwd.get()).clone()))
-                },
-                files: if flags & CLONE_FILES == CLONE_FILES {
-                    //debugln!("{}: {}: clone resources for {}", parent.pid, parent.name, clone_pid);
-
-                    parent.files.clone()
-                } else {
-                    let mut files: Vec<ContextFile> = Vec::new();
-                    for file in (*parent.files.get()).iter() {
-                        match file.resource.dup() {
-                            Ok(resource) => {
-                                //debugln!("{}: {}: dup resource {} for {}", parent.pid, parent.name, file.fd, clone_pid);
-
-                                files.push(ContextFile {
-                                    fd: file.fd,
-                                    resource: resource,
-                                });
-                            },
-                            Err(_err) => () //debugln!("{}: {}: failed to dup resource {} for {}: {}", parent.pid, parent.name, file.fd, clone_pid, err)
-                        }
-                    }
-                    Arc::new(UnsafeCell::new(files))
-                },
+                cwd: cwd,
+                files: files,
 
                 statuses: WaitMap::new(),
             }
@@ -330,7 +387,7 @@ pub unsafe fn context_clone(regs: &Regs) -> Result<usize> {
 
         contexts.push(context);
 
-        if flags & CLONE_VFORK == CLONE_VFORK {
+        if flags & syscall::CLONE_VFORK == syscall::CLONE_VFORK {
             context_switch();
         }
 
@@ -343,34 +400,44 @@ pub unsafe fn context_clone(regs: &Regs) -> Result<usize> {
 // Must have absolutely no pushes or pops
 #[cfg(target_arch = "x86")]
 #[allow(unused_variables)]
+#[inline(never)]
+#[naked]
 pub unsafe extern "cdecl" fn context_userspace(ip: usize,
                                                cs: usize,
                                                flags: usize,
                                                sp: usize,
-                                               ss: usize) {
-    asm!("mov eax, [esp + 16]
+                                               ss: usize,
+                                               tls: usize) -> ! {
+    asm!("xchg bx, bx
     mov ds, eax
     mov es, eax
     mov fs, eax
-    mov gs, eax
-    iretd" : : : "memory" : "intel", "volatile");
+    mov gs, ebx
+    add esp, 4
+    iretd" : : "{eax}"(ss), "{ebx}"(tls) : "memory" : "intel", "volatile");
+    loop {}
 }
 
 // Must have absolutely no pushes or pops
 #[cfg(target_arch = "x86_64")]
 #[allow(unused_variables)]
+#[inline(never)]
+#[naked]
 pub unsafe extern "cdecl" fn context_userspace(/*Throw away extra params from ABI*/ _rdi: usize, _rsi: usize, _rdx: usize, _rcx: usize, _r8: usize, _r9: usize,
                                                ip: usize,
                                                cs: usize,
                                                flags: usize,
                                                sp: usize,
-                                               ss: usize) {
-    asm!("mov rax, [esp + 32]
+                                               ss: usize,
+                                               tls: usize) -> ! {
+    asm!("xchg bx, bx
     mov ds, rax
     mov es, rax
-    mov fs, rax
+    mov fs, rbx
     mov gs, rax
-    iretq" : : : "memory" : "intel", "volatile");
+    add rsp, 8
+    iretq" : : "{rax}"(ss), "{rbx}"(tls) : "memory" : "intel", "volatile");
+    loop {}
 }
 
 /// Reads a Boxed function and executes it
@@ -381,7 +448,7 @@ unsafe extern "cdecl" fn context_box(box_fn_ptr: usize) {
     let box_fn = ptr::read(box_fn_ptr as *mut Box<FnBox()>);
     memory::unalloc(box_fn_ptr);
     box_fn();
-    do_sys_exit(0);
+    syscall::process::exit(0);
 }
 
 /// Reads a Boxed function and executes it
@@ -393,7 +460,7 @@ unsafe extern "cdecl" fn context_box(/*Throw away extra params from ABI*/ _rdi: 
     let box_fn = ptr::read(box_fn_ptr as *mut Box<FnBox()>);
     memory::unalloc(box_fn_ptr);
     box_fn();
-    do_sys_exit(0);
+    syscall::process::exit(0);
 }
 
 pub struct ContextMemory {
@@ -458,12 +525,7 @@ impl ContextZone {
         for entry in self.memory.iter() {
             let physical_address = unsafe { memory::alloc(entry.virtual_size) };
             if physical_address > 0 {
-                //TODO: Remap pages during memcpy
-                unsafe {
-                    ::memcpy(physical_address as *mut u8,
-                             entry.physical_address as *const u8,
-                             entry.virtual_size);
-                }
+                unsafe { memory::copy_pages(physical_address as *mut u8, entry.physical_address as *const u8, entry.virtual_size) };
 
                 //debugln!("{}: {}: dup memory {:X}:{:X} for {}", parent.pid, parent.name, entry.virtual_address, entry.virtual_address + entry.virtual_size, clone_pid);
 
@@ -487,36 +549,94 @@ impl ContextZone {
     }
 
     pub fn size(&self) -> usize {
-        let mut size = 0;
-
-        for entry in self.memory.iter() {
-            size += entry.virtual_size;
-        }
-
-        size
+        self.memory.iter().fold(0usize, |size, entry| size + entry.virtual_size)
     }
 
     /// Get the next available memory map address
-    pub fn next_mem(&self) -> usize {
-        let mut next_mem = self.address;
+    pub fn add_mem(&mut self, physical_address: usize, size: usize, writeable: bool, allocated: bool) -> Result<usize> {
+        if size <= self.size {
+            let mut virtual_address = self.address;
 
+            for i in 0..self.memory.len() {
+                if virtual_address + size <= self.address + self.size {
+                    let start = self.memory[i].virtual_address;
+                    if virtual_address + size < start {
+                        self.memory.insert(i, ContextMemory {
+                            physical_address: physical_address,
+                            virtual_address: virtual_address,
+                            virtual_size: size,
+                            writeable: writeable,
+                            allocated: allocated,
+                        });
+
+                        return Ok(virtual_address);
+                    } else {
+                        let pages = (self.memory[i].virtual_size + 4095) / 4096;
+                        let end = start + pages * 4096;
+                        virtual_address = end;
+                    }
+                } else {
+                    return Err(Error::new(ENOMEM));
+                }
+            }
+
+            if virtual_address + size <= self.address + self.size {
+                self.memory.push(ContextMemory {
+                    physical_address: physical_address,
+                    virtual_address: virtual_address,
+                    virtual_size: size,
+                    writeable: writeable,
+                    allocated: allocated,
+                });
+
+                return Ok(virtual_address);
+            } else {
+                return Err(Error::new(ENOMEM));
+            }
+        } else {
+            return Err(Error::new(ENOMEM));
+        }
+    }
+
+    /// Check permission of segment, if inside of mapped memory
+    pub fn permission(&self, ptr: usize, len: usize, writeable: bool) -> bool {
         for mem in self.memory.iter() {
-            let pages = (mem.virtual_size + 4095) / 4096;
-            let end = mem.virtual_address + pages * 4096;
-            if next_mem < end {
-                next_mem = end;
+            if ptr < mem.virtual_address {
+                continue;
+            }
+            let end = mem.virtual_address + mem.virtual_size; // Presumably guaranteed not to overflow by construction
+            if ptr >= end {
+                continue;
+            }
+            let max_len = end - ptr; // Guaranteed not to overflow by preceding check
+            if len > max_len {
+                continue;
+            }
+
+            if mem.writeable || ! writeable {
+                return true;
             }
         }
 
-        return next_mem;
+        false
     }
 
     /// Translate to physical if a ptr is inside of the mapped memory
     pub fn translate(&self, ptr: usize, len: usize) -> Option<usize> {
         for mem in self.memory.iter() {
-            if ptr >= mem.virtual_address && ptr + len <= mem.virtual_address + mem.virtual_size {
-                return Some(ptr - mem.virtual_address + mem.physical_address);
+            if ptr < mem.virtual_address {
+                continue;
             }
+            let end = mem.virtual_address + mem.virtual_size; // Presumably guaranteed not to overflow by construction
+            if ptr >= end {
+                continue;
+            }
+            let max_len = end - ptr; // Guaranteed not to overflow by preceding check
+            if len > max_len {
+                continue;
+            }
+
+            return Some(ptr - mem.virtual_address + mem.physical_address);
         }
 
         None
@@ -563,9 +683,16 @@ impl ContextZone {
 }
 
 #[derive(Clone)]
-pub struct EnvironmentVariable {
-    name: String,
-    value: String
+pub struct EnvVar(pub String, pub String);
+
+impl EnvVar {
+    pub fn name(&self) -> &str {
+        &self.0
+    }
+
+    pub fn value(&self) -> &str {
+        &self.1
+    }
 }
 
 pub struct Context {
@@ -575,11 +702,11 @@ pub struct Context {
     /// The PID of the parent
     pub ppid: usize,
     /// The name of the context
-    pub name: String,
+    pub name: Cow<'static, str>,
     /// The I/O privilege level
     pub iopl: usize,
     /// Indicates that the context is blocked, and should not be switched to
-    pub blocked: bool,
+    pub blocked: usize,
     /// Indicates that the context exited
     pub exited: bool,
     /// How many times was the context switched to
@@ -601,6 +728,8 @@ pub struct Context {
     ///
     /// This means that the process is waiting for the superviser to handle the syscall.
     pub blocked_syscall: bool,
+    /// The current syscall
+    pub current_syscall: Option<(usize, usize, usize, usize, usize)>,
 
     // These members control the stack and registers and are unique to each context {
     // The kernel stack
@@ -611,6 +740,8 @@ pub struct Context {
     pub fx: usize,
     /// The context stack
     pub stack: Option<ContextMemory>,
+    /// The context TLS
+    pub tls: Option<ContextMemory>,
     /// Indicates that registers can be loaded (they must be saved first)
     pub loadable: bool,
     // }
@@ -622,8 +753,11 @@ pub struct Context {
     pub heap: Arc<UnsafeCell<ContextZone>>,
     /// Mmap memory, cloned for threads, copied or created for processes. Modified by mmap
     pub mmap: Arc<UnsafeCell<ContextZone>>,
-    /// Environment variables, cloned for threads, copied or created for processes. Modified by set_env
-    pub env_vars: Arc<UnsafeCell<Vec<EnvironmentVariable>>>,
+    /// Master TLS copy
+    pub tls_master: Arc<UnsafeCell<Option<ContextMemory>>>,
+    /// Environment variables, cloned for threads, copied or created for
+    /// processes. Modified by set_env
+    pub env_vars: Arc<UnsafeCell<Vec<EnvVar>>>,
 
     /// Program working directory, cloned for threads, copied or created for processes. Modified by chdir
     pub cwd: Arc<UnsafeCell<String>>,
@@ -637,7 +771,7 @@ pub struct Context {
 
 impl Context {
     pub fn next_pid() -> usize {
-        let mut contexts = ::env().contexts.lock();
+        let contexts = unsafe { &mut *::env().contexts.get() };
 
         let mut next_pid = contexts.next_pid;
 
@@ -666,14 +800,14 @@ impl Context {
     }
 
     pub unsafe fn root() -> Box<Self> {
-        let fx = memory::alloc(512);
+        let fx = memory::alloc(CONTEXT_FX_SIZE);
 
         box Context {
             pid: Context::next_pid(),
             ppid: 0,
-            name: "kidle".to_string(),
+            name: "kidle".into(),
             iopl: 3,
-            blocked: false,
+            blocked: 0,
             exited: false,
             switch: 0,
             time: 0,
@@ -682,16 +816,19 @@ impl Context {
 
             supervised: false,
             blocked_syscall: false,
+            current_syscall: None,
 
             kernel_stack: 0,
             regs: Regs::default(),
             fx: fx,
             stack: None,
+            tls: None,
             loadable: false,
 
             image: Arc::new(UnsafeCell::new(ContextZone::new(CONTEXT_IMAGE_ADDR, CONTEXT_IMAGE_SIZE))),
             heap: Arc::new(UnsafeCell::new(ContextZone::new(CONTEXT_HEAP_ADDR, CONTEXT_HEAP_SIZE))),
             mmap: Arc::new(UnsafeCell::new(ContextZone::new(CONTEXT_MMAP_ADDR, CONTEXT_MMAP_SIZE))),
+            tls_master: Arc::new(UnsafeCell::new(None)),
             env_vars: Arc::new(UnsafeCell::new(Vec::new())),
 
             cwd: Arc::new(UnsafeCell::new(String::new())),
@@ -701,20 +838,19 @@ impl Context {
         }
     }
 
-    pub unsafe fn new(name: String, call: usize, args: &Vec<usize>) -> Box<Self> {
-        let kernel_stack = memory::alloc(CONTEXT_STACK_SIZE + 512);
+    pub unsafe fn new(name: Cow<'static, str>, call: usize, args: &Vec<usize>) -> Box<Self> {
+        let kernel_stack = memory::alloc(CONTEXT_STACK_SIZE);
+        let fx = memory::alloc(CONTEXT_FX_SIZE);
 
         let mut regs = Regs::default();
         regs.sp = kernel_stack + CONTEXT_STACK_SIZE - 128;
-
-        let fx = kernel_stack + CONTEXT_STACK_SIZE;
 
         let mut ret = box Context {
             pid: Context::next_pid(),
             ppid: 0,
             name: name,
             iopl: 3,
-            blocked: false,
+            blocked: 0,
             exited: false,
             switch: 0,
             time: 0,
@@ -723,16 +859,19 @@ impl Context {
 
             supervised: false,
             blocked_syscall: false,
+            current_syscall: None,
 
             kernel_stack: kernel_stack,
             regs: regs,
             fx: fx,
             stack: None,
+            tls: None,
             loadable: false,
 
             image: Arc::new(UnsafeCell::new(ContextZone::new(CONTEXT_IMAGE_ADDR, CONTEXT_IMAGE_SIZE))),
             heap: Arc::new(UnsafeCell::new(ContextZone::new(CONTEXT_HEAP_ADDR, CONTEXT_HEAP_SIZE))),
             mmap: Arc::new(UnsafeCell::new(ContextZone::new(CONTEXT_MMAP_ADDR, CONTEXT_MMAP_SIZE))),
+            tls_master: Arc::new(UnsafeCell::new(None)),
             env_vars: Arc::new(UnsafeCell::new(Vec::new())),
 
             cwd: Arc::new(UnsafeCell::new(String::new())),
@@ -750,7 +889,7 @@ impl Context {
         ret
     }
 
-    pub fn spawn(name: String, box_fn: Box<FnBox()>) -> usize {
+    pub fn spawn(name: Cow<'static, str>, box_fn: Box<FnBox()>) -> usize {
         let ret;
 
         unsafe {
@@ -765,13 +904,32 @@ impl Context {
 
             ret = context.pid;
 
-            ::env().contexts.lock().push(context);
+            (&mut *::env().contexts.get()).push(context);
         }
 
         ret
     }
 
+    pub fn block(&mut self, _reason: &str) {
+        self.blocked += 1;
+        // debugln!("    BLOCK {}: {}: {} {}", self.pid, self.name, self.blocked, reason);
+    }
+
+    pub fn unblock(&mut self, _reason: &str) {
+        // debugln!("    UNBLOCK {}: {}: {} {}", self.pid, self.name, self.blocked, reason);
+        if self.blocked > 0 {
+            self.blocked -= 1;
+        }
+    }
+
+    pub fn exit(&mut self) {
+        // debugln!("    EXIT {}: {}", self.pid, self.name);
+        self.files = Arc::new(UnsafeCell::new(Vec::new()));
+        self.exited = true;
+    }
+
     pub fn canonicalize(&self, path: &str) -> String {
+        // TODO my eyes burn, rewrite this.
         if path.find(':').is_none() {
             let cwd = unsafe { &*self.cwd.get() };
             if path == "." {
@@ -848,11 +1006,70 @@ impl Context {
         ptr::write(self.regs.sp as *mut usize, data);
     }
 
+    /// Access a raw pointer safely
+    pub fn get_ref<'a, T>(&'a self, ptr: *const T) -> Result<&'a T> {
+        self.permission(ptr as usize, mem::size_of::<T>(), false)?;
+        Ok(unsafe { &*ptr })
+    }
+
+    /// Access a mutable raw pointer safely
+    pub fn get_ref_mut<'a, T>(&'a self, ptr: *mut T) -> Result<&'a mut T> {
+        self.permission(ptr as usize, mem::size_of::<T>(), true)?;
+        Ok(unsafe { &mut *ptr })
+    }
+
+    /// Access a raw pointer safely
+    pub fn get_slice<'a, T>(&'a self, ptr: *const T, len: usize) -> Result<&'a [T]> {
+        self.permission(ptr as usize, mem::size_of::<T>() * len, false)?;
+        Ok(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    /// Access a mutable raw pointer safely
+    pub fn get_slice_mut<'a, T>(&'a self, ptr: *mut T, len: usize) -> Result<&'a mut [T]> {
+        self.permission(ptr as usize, mem::size_of::<T>() * len, true)?;
+        Ok(unsafe { slice::from_raw_parts_mut(ptr, len) })
+    }
+
+    /// Check permission of segment, if inside of mapped memory
+    pub fn permission(&self, ptr: usize, len: usize, writeable: bool) -> Result<()> {
+        if let Some(ref stack) = self.stack {
+            if ptr >= stack.virtual_address && ptr + len <= stack.virtual_address + stack.virtual_size {
+                return Ok(());
+            }
+        }
+
+        if let Some(ref tls) = self.tls {
+            if ptr >= tls.virtual_address && ptr + len <= tls.virtual_address + tls.virtual_size {
+                return Ok(());
+            }
+        }
+
+        if unsafe { (*self.image.get()).permission(ptr, len, writeable) } {
+            return Ok(());
+        }
+
+        if unsafe { (*self.heap.get()).permission(ptr, len, writeable) } {
+            return Ok(());
+        }
+
+        if unsafe { (*self.mmap.get()).permission(ptr, len, writeable) } {
+            return Ok(());
+        }
+
+        Err(Error::new(EFAULT))
+    }
+
     /// Translate to physical if a ptr is inside of the mapped memory
     pub fn translate(&self, ptr: usize, len: usize) -> Result<usize> {
         if let Some(ref stack) = self.stack {
             if ptr >= stack.virtual_address && ptr + len <= stack.virtual_address + stack.virtual_size {
                 return Ok(ptr - stack.virtual_address + stack.physical_address);
+            }
+        }
+
+        if let Some(ref tls) = self.tls {
+            if ptr >= tls.virtual_address && ptr + len <= tls.virtual_address + tls.virtual_size {
+                return Ok(ptr - tls.virtual_address + tls.physical_address);
             }
         }
 
@@ -871,11 +1088,12 @@ impl Context {
         Err(Error::new(EFAULT))
     }
 
-    /// Gets an environment variable. Returns `Err` if the variable is not defined
-    pub fn get_env_var(&self, var_name: &str) -> Result<String> {
+    /// Gets an environment variable. Returns `Err` if the variable is not
+    /// defined
+    pub fn get_env_var(&self, var_name: &str) -> Result<&str> {
         for variable in unsafe { (*self.env_vars.get()).iter() } {
-            if &variable.name == var_name {
-                return Ok(variable.value.clone());
+            if variable.name() == var_name {
+                return Ok(variable.value());
             }
         }
         Err(Error::new(ENOENT))
@@ -889,28 +1107,24 @@ impl Context {
         }
 
         for mut variable in unsafe { (*self.env_vars.get()).iter_mut() } {
-            if &variable.name == name {
-                variable.value = String::from(value);
+            if variable.name() == name {
+                variable.1 = String::from(value);
                 return Ok(());
             }
         }
-        unsafe { (*self.env_vars.get()).push(EnvironmentVariable { name: String::from(name), value: String::from(value) }) };
+        unsafe { (*self.env_vars.get()).push(EnvVar(String::from(name), String::from(value))) };
         Ok(())
     }
 
-    /// Returns a list of the environment variables
-    pub fn list_env_vars(&self) -> Result<Vec<(String, String)>> {
-        let mut vars_buf = Vec::new();
-        for ref variable in unsafe { (*self.env_vars.get()).iter() } {
-            vars_buf.push((variable.name.clone(), variable.value.clone()));
-        }
-        Ok(vars_buf)
+    /// Returns a slice of the environment variables
+    pub fn list_env_vars(&self) -> &[EnvVar] {
+        unsafe { &*self.env_vars.get() }
     }
 
     /// Removes the environment variable named `name`. Returns `Err` if the variable doesn't exist
     pub fn remove_env_var(&self, name: &str) -> Result<()> {
         for (i, variable) in unsafe { (*self.env_vars.get()).iter().enumerate() } {
-            if &variable.name == name {
+            if variable.name() == name {
                 unsafe { (*self.env_vars.get()).remove(i) };
                 return Ok(());
             }
@@ -922,6 +1136,9 @@ impl Context {
         if let Some(ref mut stack) = self.stack {
             stack.map();
         }
+        if let Some(ref mut tls) = self.tls {
+            tls.map();
+        }
         (*self.image.get()).map();
         (*self.heap.get()).map();
         (*self.mmap.get()).map();
@@ -931,6 +1148,9 @@ impl Context {
         (*self.mmap.get()).unmap();
         (*self.heap.get()).unmap();
         (*self.image.get()).unmap();
+        if let Some(ref mut tls) = self.tls {
+            tls.unmap();
+        }
         if let Some(ref mut stack) = self.stack {
             stack.unmap();
         }
@@ -1016,10 +1236,10 @@ impl Context {
 impl Drop for Context {
     fn drop(&mut self) {
         if let Some(vfork) = self.vfork.take() {
-            unsafe { (*vfork).blocked = false; }
+            unsafe { (*vfork).unblock("Context::drop vfork") };
         }
         if self.kernel_stack > 0 {
-            unsafe { memory::unalloc(self.kernel_stack); }
+            unsafe { memory::unalloc(self.kernel_stack) };
         }
     }
 }

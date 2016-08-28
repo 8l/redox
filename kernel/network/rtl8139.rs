@@ -6,6 +6,7 @@ use collections::slice;
 use collections::vec::Vec;
 use collections::vec_deque::VecDeque;
 
+use core::cell::UnsafeCell;
 use core::ptr;
 
 use drivers::pci::config::PciConfig;
@@ -14,11 +15,9 @@ use drivers::io::{Io, Pio};
 use network::common::*;
 use network::scheme::*;
 
-use fs::{KScheme, Resource, Url};
+use fs::{KScheme, Resource};
 
 use system::error::Result;
-
-use sync::Intex;
 
 bitflags! {
     flags TsrFlags: u32 {
@@ -113,7 +112,7 @@ pub struct Rtl8139 {
     base: usize,
     memory_mapped: bool,
     irq: u8,
-    resources: Intex<Vec<*mut NetworkResource>>,
+    resources: UnsafeCell<Vec<*mut NetworkResource>>,
     inbound: VecDeque<Vec<u8>>,
     outbound: VecDeque<Vec<u8>>,
     txds: Vec<Txd>,
@@ -123,12 +122,6 @@ pub struct Rtl8139 {
 
 impl Rtl8139 {
     pub fn new(mut pci: PciConfig) -> Box<Self> {
-        let pci_id = unsafe { pci.read(0x00) };
-        let revision = (unsafe { pci.read(0x08) } & 0xFF) as u8;
-        if pci_id == 0x813910EC && revision < 0x20 {
-            debugln!("Not an 8139C+ compatible chip");
-        }
-
         let base = unsafe { pci.read(0x10) as usize };
         let irq = unsafe { pci.read(0x3C) as u8 & 0xF };
 
@@ -137,7 +130,7 @@ impl Rtl8139 {
             base: base & 0xFFFFFFF0,
             memory_mapped: base & 1 == 0,
             irq: irq,
-            resources: Intex::new(Vec::new()),
+            resources: UnsafeCell::new(Vec::new()),
             inbound: VecDeque::new(),
             outbound: VecDeque::new(),
             txds: Vec::new(),
@@ -151,7 +144,14 @@ impl Rtl8139 {
     }
 
     unsafe fn init(&mut self) {
-        debugln!(" + RTL8139 on: {:X}, IRQ: {:X}", self.base, self.irq);
+        syslog_info!(" + RTL8139 on: {:X}, IRQ: {:X}", self.base, self.irq);
+
+        let pci_id = self.pci.read(0x00);
+        let revision = (self.pci.read(0x08) & 0xFF) as u8;
+
+        if pci_id == 0x813910EC && revision < 0x20 {
+            syslog_info!("   - Not an 8139C+ compatible chip");
+        }
 
         self.pci.flag(4, 4, true); // Bus mastering
 
@@ -169,7 +169,7 @@ impl Rtl8139 {
                     self.port.idr[4].read(),
                     self.port.idr[5].read()],
         };
-        debugln!("   - MAC: {}", &MAC_ADDR.to_string());
+        syslog_info!("   - MAC: {}", &MAC_ADDR.to_string());
 
         let receive_buffer = memory::alloc(10240);
         self.port.rbstart.write(receive_buffer as u32);
@@ -193,16 +193,21 @@ impl Rtl8139 {
         let mut capr = (self.port.capr.read() + 16) as usize;
         let cbr = self.port.cbr.read() as usize;
 
-        while capr != cbr {
+        while self.port.cr.read() & CR_BUFE.bits != CR_BUFE.bits {
             let frame_addr = receive_buffer + capr + 4;
-            //let frame_status = ptr::read((receive_buffer + capr) as *const u16) as usize;
+            let frame_status = ptr::read((receive_buffer + capr) as *const u16) as usize;
             let frame_len = ptr::read((receive_buffer + capr + 2) as *const u16) as usize;
 
-            self.inbound.push_back(Vec::from(slice::from_raw_parts(frame_addr as *const u8, frame_len - 4)));
+            //debugln!("RTL8139: CAPR {} CBR {} STATUS {:X} LEN {}", capr, cbr, frame_status, frame_len);
+            if frame_len >= 4 {
+                self.inbound.push_back(Vec::from(slice::from_raw_parts(frame_addr as *const u8, frame_len - 4)));
+            } else {
+                panic!("RTL8139: Empty Packet: CAPR {} CBR {} STATUS {:X} LEN {}", capr, cbr, frame_status, frame_len);
+            }
 
             capr = capr + frame_len + 4;
             capr = (capr + 3) & (0xFFFFFFFF - 3);
-            if capr >= 8192 {
+            if capr >= 8192 + 16 {
                 capr -= 8192
             }
 
@@ -238,7 +243,7 @@ impl KScheme for Rtl8139 {
         "network"
     }
 
-    fn open(&mut self, _: Url, _: usize) -> Result<Box<Resource>> {
+    fn open(&mut self, _: &str, _: usize) -> Result<Box<Resource>> {
         Ok(NetworkResource::new(self))
     }
 
@@ -257,11 +262,11 @@ impl KScheme for Rtl8139 {
 
 impl NetworkScheme for Rtl8139 {
     fn add(&mut self, resource: *mut NetworkResource) {
-        self.resources.lock().push(resource);
+        unsafe { &mut *self.resources.get() }.push(resource);
     }
 
     fn remove(&mut self, resource: *mut NetworkResource) {
-        let mut resources = self.resources.lock();
+        let mut resources = unsafe { &mut *self.resources.get() };
 
         let mut i = 0;
         while i < resources.len() {
@@ -283,28 +288,26 @@ impl NetworkScheme for Rtl8139 {
     }
 
     fn sync(&mut self) {
-        unsafe {
-            {
-                let resources = self.resources.lock();
+        {
+            let resources = unsafe { &mut *self.resources.get() };
 
-                for resource in resources.iter() {
-                    while let Some(bytes) = (**resource).outbound.lock().pop_front() {
-                        self.outbound.push_back(bytes);
-                    }
+            for resource in resources.iter() {
+                while let Some(bytes) = unsafe { &mut *(**resource).outbound.get() }.pop_front() {
+                    self.outbound.push_back(bytes);
                 }
             }
+        }
 
-            self.send_outbound();
+        unsafe { self.send_outbound(); }
 
-            self.receive_inbound();
+        unsafe { self.receive_inbound(); }
 
-            {
-                let resources = self.resources.lock();
+        {
+            let resources = unsafe { &mut *self.resources.get() };
 
-                while let Some(bytes) = self.inbound.pop_front() {
-                    for resource in resources.iter() {
-                        (**resource).inbound.send(bytes.clone());
-                    }
+            while let Some(bytes) = self.inbound.pop_front() {
+                for resource in resources.iter() {
+                    unsafe { (**resource).inbound.send(bytes.clone(), "Rtl8139::sync") };
                 }
             }
         }

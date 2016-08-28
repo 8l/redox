@@ -145,7 +145,7 @@ impl Ide {
         let bar4 = unsafe { pci.read(0x20) } as u16 & 0xFFF0;
         let irq = unsafe { pci.read(0x3C) } as u8 & 0xF;
 
-        debugln!(" + IDE on {:X}, {:X}, {:X}, {:X}, {:X}, IRQ: {:X}", bar0, bar1, bar2, bar3, bar4, irq);
+        syslog_info!(" + IDE on {:X}, {:X}, {:X}, {:X}, {:X}, IRQ: {:X}", bar0, bar1, bar2, bar3, bar4, irq);
 
         let port_or = |value: u16, or_value: u16| -> u16 {
             if value > 0 {
@@ -161,19 +161,15 @@ impl Ide {
             let control = port_or(bar1, 0x3F4);
             let irq = 0xE;
 
-            debugln!("   + Primary on: {:X}, {:X}, {:X}, IRQ {:X}", busmaster, data, control, irq);
+            syslog_info!("   + Primary on: {:X}, {:X}, {:X}, IRQ {:X}", busmaster, data, control, irq);
 
-            debug!("     + Master:");
             if let Some(disk) = IdeDisk::new(busmaster, data, control, irq, true) {
                 ret.push(box disk);
             }
-            debugln!("");
 
-            debug!("     + Slave:");
             if let Some(disk) = IdeDisk::new(busmaster, data, control, irq, false) {
                 ret.push(box disk);
             }
-            debugln!("");
         }
 
         {
@@ -182,19 +178,15 @@ impl Ide {
             let control = port_or(bar3, 0x374);
             let irq = 0xF;
 
-            debugln!("   + Secondary on: {:X}, {:X}, {:X}, IRQ {:X}", busmaster, data, control, irq);
+            syslog_info!("   + Secondary on: {:X}, {:X}, {:X}, IRQ {:X}", busmaster, data, control, irq);
 
-            debug!("     + Master:");
             if let Some(disk) = IdeDisk::new(busmaster, data, control, irq, true) {
                 ret.push(box disk);
             }
-            debugln!("");
 
-            debug!("     + Slave:");
             if let Some(disk) = IdeDisk::new(busmaster, data, control, irq, false) {
                 ret.push(box disk);
             }
-            debugln!("");
         }
 
         ret
@@ -300,16 +292,15 @@ impl IdeDisk {
 
     /// Identify
     pub unsafe fn identify(&mut self) -> Option<u64> {
-        if self.alt_sts.read() == 0xFF {
-            debug!(" Floating Bus");
+        let name = if self.master { "Master" } else { "Slave" };
 
+        if self.alt_sts.read() == 0xFF {
             return None;
         }
 
         self.ata(ATA_CMD_IDENTIFY, 0, 0);
 
         let status = self.alt_sts.read();
-        debug!(" Status: {:X}", status);
 
         if status == 0 {
             return None;
@@ -317,7 +308,7 @@ impl IdeDisk {
 
         let err = self.ide_poll(true);
         if err > 0 {
-            debug!(" Error: {:X}", err);
+            syslog_info!("     + {}: Error: {:X}", name, err);
 
             return None;
         }
@@ -327,42 +318,42 @@ impl IdeDisk {
             destination.write(word, self.data.read());
         }
 
-        debug!(" Serial: ");
+        let mut serial = String::new();
         for word in 10..20 {
             let d = destination.read(word);
             let a = ((d >> 8) as u8) as char;
-            if a != ' ' && a != '\0' {
-                debug!("{}", a);
+            if a != '\0' {
+                serial.push(a);
             }
             let b = (d as u8) as char;
-            if b != ' ' && b != '\0' {
-                debug!("{}", b);
+            if b != '\0' {
+                serial.push(b);
             }
         }
 
-        debug!(" Firmware: ");
+        let mut firmware = String::new();
         for word in 23..27 {
             let d = destination.read(word);
             let a = ((d >> 8) as u8) as char;
-            if a != ' ' && a != '\0' {
-                debug!("{}", a);
+            if a != '\0' {
+                firmware.push(a);
             }
             let b = (d as u8) as char;
-            if b != ' ' && b != '\0' {
-                debug!("{}", b);
+            if b != '\0' {
+                firmware.push(b);
             }
         }
 
-        debug!(" Model: ");
+        let mut model = String::new();
         for word in 27..47 {
             let d = destination.read(word);
             let a = ((d >> 8) as u8) as char;
-            if a != ' ' && a != '\0' {
-                debug!("{}", a);
+            if a != '\0' {
+                model.push(a);
             }
             let b = (d as u8) as char;
-            if b != ' ' && b != '\0' {
-                debug!("{}", b);
+            if b != '\0' {
+                model.push(b);
             }
         }
 
@@ -371,14 +362,15 @@ impl IdeDisk {
                           ((destination.read(102) as u64) << 32) |
                           ((destination.read(103) as u64) << 48);
 
-        if sectors == 0 {
-            debug!(" 28-bit LBA");
+        let lba_bits = if sectors == 0 {
             sectors = (destination.read(60) as u64) | ((destination.read(61) as u64) << 16);
+            28
         } else {
-            debug!(" 48-bit LBA");
-        }
+            48
+        };
 
-        debug!(" Size: {} MB", (sectors / 2048) as usize);
+        syslog_info!("     + {}: Serial: {} Firmware: {} Model: {} {}-bit LBA Size: {} MB",
+                    name, serial.trim(), firmware.trim(), model.trim(), lba_bits, sectors / 2048);
 
         Some(sectors * 512)
     }
@@ -540,7 +532,7 @@ impl IdeDisk {
         // debugln!("IDE DMA BLOCK: {} SECTORS: {} BUF: {:X} WRITE: {}", block, sectors, buf, write);
 
         if sectors > 0 {
-            let contexts = ::env().contexts.lock();
+            let contexts = unsafe { & *::env().contexts.get() };
             let current = try!(contexts.current());
             let physical_address = try!(current.translate(buf, sectors * 512));
 
@@ -586,6 +578,12 @@ impl Disk for IdeDisk {
         } else {
             "Slave"
         })
+    }
+
+    fn on_irq(&mut self, irq: u8) {
+        if irq == self.irq {
+            //debugln!("IDE IRQ");
+        }
     }
 
     fn size(&self) -> u64 {

@@ -4,15 +4,15 @@ use collections::vec::Vec;
 
 use core::{cmp, mem};
 
-use common::debug;
 use common::to_num::ToNum;
 
 use network::common::*;
 use network::ethernet::*;
 
-use fs::{KScheme, Resource, Url};
+use fs::{KScheme, Resource};
 
 use system::error::{Error, Result, ENOENT};
+use system::syscall::O_RDWR;
 
 /// A ethernet resource
 pub struct EthernetResource {
@@ -63,23 +63,20 @@ impl Resource for EthernetResource {
         }
 
         loop {
-            let mut bytes = [0; 8192];
-            match self.network.read(&mut bytes) {
-                Ok(count) => {
-                    if let Some(frame) = EthernetII::from_bytes(bytes[.. count].to_vec()) {
-                        if frame.header.ethertype.get() == self.ethertype && (unsafe { frame.header.dst.equals(MAC_ADDR) }
-                            || frame.header.dst.equals(BROADCAST_MAC_ADDR)) && (frame.header.src.equals(self.peer_addr)
-                            || self.peer_addr.equals(BROADCAST_MAC_ADDR))
-                        {
-                            for (b, d) in buf.iter_mut().zip(frame.data.iter()) {
-                                *b = *d;
-                            }
+            let mut bytes = [0; 65536];
+            let count = try!(self.network.read(&mut bytes));
 
-                            return Ok(cmp::min(buf.len(), frame.data.len()));
-                        }
+            if let Some(frame) = EthernetII::from_bytes(&bytes[..count]) {
+                if frame.header.ethertype.get() == self.ethertype /* && (unsafe { frame.header.dst.equals(MAC_ADDR) }
+                    || frame.header.dst.equals(BROADCAST_MAC_ADDR)) && (frame.header.src.equals(self.peer_addr)
+                    || self.peer_addr.equals(BROADCAST_MAC_ADDR))*/
+                {
+                    for (b, d) in buf.iter_mut().zip(frame.data.iter()) {
+                        *b = *d;
                     }
+
+                    return Ok(cmp::min(buf.len(), frame.data.len()));
                 }
-                Err(err) => return Err(err),
             }
         }
     }
@@ -113,11 +110,11 @@ impl KScheme for EthernetScheme {
         "ethernet"
     }
 
-    fn open(&mut self, url: Url, _: usize) -> Result<Box<Resource>> {
-        let parts: Vec<&str> = url.reference().split("/").collect();
+    fn open(&mut self, url: &str, _: usize) -> Result<Box<Resource>> {
+        let parts: Vec<&str> = url.splitn(2, ":").nth(1).unwrap_or("").split("/").collect();
         if let Some(host_string) = parts.get(0) {
             if let Some(ethertype_string) = parts.get(1) {
-                if let Ok(mut network) = Url::from_str("network:").unwrap().open() {
+                if let Ok(mut network) = ::env().open("network:", O_RDWR) {
                     let ethertype = ethertype_string.to_num_radix(16) as u16;
 
                     if !host_string.is_empty() {
@@ -129,10 +126,10 @@ impl KScheme for EthernetScheme {
                         });
                     } else {
                         loop {
-                            let mut bytes = [0; 8192];
+                            let mut bytes = [0; 65536];
                             match network.read(&mut bytes) {
                                 Ok(count) => {
-                                    if let Some(frame) = EthernetII::from_bytes(bytes[.. count].to_vec()) {
+                                    if let Some(frame) = EthernetII::from_bytes(&bytes[..count]) {
                                         if frame.header.ethertype.get() == ethertype &&
                                            (unsafe { frame.header.dst.equals(MAC_ADDR) } ||
                                             frame.header.dst.equals(BROADCAST_MAC_ADDR)) {
@@ -150,13 +147,13 @@ impl KScheme for EthernetScheme {
                         }
                     }
                 } else {
-                    debug::d("Ethernet: Failed to open network:\n");
+                    debug!("Ethernet: Failed to open network:\n");
                 }
             } else {
-                debug::d("Ethernet: No ethertype provided\n");
+                debug!("Ethernet: No ethertype provided\n");
             }
         } else {
-            debug::d("Ethernet: No host provided\n");
+            debug!("Ethernet: No host provided\n");
         }
 
         Err(Error::new(ENOENT))

@@ -1,5 +1,8 @@
 use alloc::boxed::Box;
-use fs::{KScheme, Resource, Url};
+
+use core::str;
+
+use fs::{KScheme, Resource};
 use system::error::{Error, Result, ENOENT};
 use system::syscall::O_CREAT;
 pub use self::dsdt::DSDT;
@@ -43,26 +46,22 @@ impl Acpi {
                 for addr in acpi.rsdt.addrs.iter() {
                     let header = unsafe { &*(*addr as *const SDTHeader) };
                     if let Some(fadt) = FADT::new(header) {
-                        // Why does this hang? debugln!("{:#?}", fadt);
-                        if let Some(dsdt) = DSDT::new(unsafe {
-                            &*(fadt.dsdt as *const SDTHeader)
-                        }) {
-                            // debugln!("DSDT:");
-                            // aml::parse(dsdt.data);
+                        //Can't do it debugln!("{:#?}", fadt);
+                        if let Some(dsdt) = DSDT::new(unsafe { &*(fadt.dsdt as *const SDTHeader) }) {
+                            syslog_debug!("DSDT:");
+                            aml::parse(dsdt.data);
                             acpi.dsdt = Some(dsdt);
                         }
                         acpi.fadt = Some(fadt);
                     } else if let Some(ssdt) = SSDT::new(header) {
-                        // debugln!("SSDT:");
-                        // aml::parse(ssdt.data);
+                        syslog_debug!("SSDT:");
+                        aml::parse(ssdt.data);
                         acpi.ssdt = Some(ssdt);
                     } else if let Some(madt) = MADT::new(header) {
+                        syslog_debug!("{:#?}", madt);
                         acpi.madt = Some(madt);
                     } else {
-                        for b in header.signature.iter() {
-                            debug!("{}", *b as char);
-                        }
-                        debugln!(": Unknown Table");
+                        syslog_debug!("{}: Unknown Table", unsafe { str::from_utf8_unchecked(&header.signature) });
                     }
                 }
 
@@ -77,12 +76,12 @@ impl Acpi {
 }
 
 impl KScheme for Acpi {
-    fn scheme(&self) -> &str {
+    fn scheme(&self) -> &'static str {
         "acpi"
     }
 
-    fn open(&mut self, url: Url, flags: usize) -> Result<Box<Resource>> {
-        if url.reference() == "off" && flags & O_CREAT == O_CREAT {
+    fn open(&mut self, url: &str, flags: usize) -> Result<Box<Resource>> {
+        if url.splitn(2, ":").nth(1).unwrap_or("") == "off" && flags & O_CREAT == O_CREAT {
             match self.fadt {
                 Some(fadt) => {
                     debugln!("Powering Off");

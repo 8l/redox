@@ -1,12 +1,17 @@
+//! System calls for execution of programs or threads.
+
 use alloc::arc::Arc;
 
 use arch::context::{CONTEXT_IMAGE_ADDR, CONTEXT_IMAGE_SIZE, CONTEXT_HEAP_ADDR, CONTEXT_HEAP_SIZE,
                     CONTEXT_MMAP_ADDR, CONTEXT_MMAP_SIZE, CONTEXT_STACK_SIZE, CONTEXT_STACK_ADDR,
+                    CONTEXT_TLS_ADDR,
                     context_switch, context_userspace, Context, ContextMemory, ContextZone};
+use arch::gdt::{GDT_USER_CODE, GDT_USER_DATA, GDT_USER_TLS, GdtEntry};
 use arch::elf::Elf;
 use arch::memory;
 use arch::regs::Regs;
 
+use collections::borrow::ToOwned;
 use collections::string::{String, ToString};
 use collections::vec::Vec;
 
@@ -16,12 +21,12 @@ use core::cell::UnsafeCell;
 use core::ops::DerefMut;
 use core::{mem, ptr, slice, str};
 
-use fs::Url;
-
 use system::error::{Error, Result, ENOEXEC, ENOMEM};
+use system::syscall::O_RDONLY;
 
 pub fn execute_thread(context_ptr: *mut Context, entry: usize, mut args: Vec<String>) -> ! {
-    Context::spawn("kexec".to_string(), box move || {
+    Context::spawn("kexec".into(),
+                   box move || {
         let context = unsafe { &mut *context_ptr };
 
         let mut context_args: Vec<usize> = Vec::new();
@@ -38,20 +43,10 @@ pub fn execute_thread(context_ptr: *mut Context, entry: usize, mut args: Vec<Str
                 physical_address -= 0x80000000;
             }
 
-            let virtual_address = unsafe { (*context.image.get()).next_mem() };
             let virtual_size = arg.len();
+            let virtual_address = unsafe { (*context.image.get()).add_mem(physical_address, virtual_size, false, true) }.unwrap();
 
             mem::forget(arg);
-
-            unsafe {
-                (*context.image.get()).memory.push(ContextMemory {
-                    physical_address: physical_address,
-                    virtual_address: virtual_address,
-                    virtual_size: virtual_size,
-                    writeable: false,
-                    allocated: true,
-                });
-            }
 
             context_args.push(virtual_address as usize);
             argc += 1;
@@ -71,6 +66,32 @@ pub fn execute_thread(context_ptr: *mut Context, entry: usize, mut args: Vec<Str
             allocated: true,
         });
 
+        unsafe {
+            if let Some(ref mut tls_master) = *context.tls_master.get() {
+                let mut tls = ContextMemory {
+                    physical_address: memory::alloc_aligned(tls_master.virtual_size + 4096, 4096),
+                    virtual_address: CONTEXT_TLS_ADDR,
+                    virtual_size: tls_master.virtual_size + 4096,
+                    writeable: true,
+                    allocated: true
+                };
+
+                tls_master.map();
+                tls.map();
+
+                *(tls.virtual_address as *mut usize) = tls.virtual_address + tls.virtual_size;
+
+                ::memcpy((tls.virtual_address + tls.virtual_size - tls_master.virtual_size) as *mut u8,
+                        tls_master.virtual_address as *const u8,
+                        tls_master.virtual_size);
+
+                tls.unmap();
+                tls_master.unmap();
+
+                context.tls = Some(tls);
+            }
+        }
+
         let user_sp = if let Some(ref stack) = context.stack {
             let mut sp = stack.physical_address + stack.virtual_size - 128;
             for arg in context_args.iter() {
@@ -82,17 +103,19 @@ pub fn execute_thread(context_ptr: *mut Context, entry: usize, mut args: Vec<Str
             0
         };
 
-        unsafe {
-            context.push(0x20 | 3);
-            context.push(user_sp);
-            context.push(1 << 9);
-            context.push(0x18 | 3);
-            context.push(entry);
-            context.push(context_userspace as usize);
+        if let Some(vfork) = context.vfork.take() {
+            unsafe { (*vfork).unblock("execute_thread vfork") }
         }
 
-        if let Some(vfork) = context.vfork.take() {
-            unsafe { (*vfork).blocked = false; }
+        unsafe {
+            context.push((GDT_USER_TLS * mem::size_of::<GdtEntry>()) | 3);
+            context.push((GDT_USER_DATA * mem::size_of::<GdtEntry>()) | 3);
+            context.push(user_sp);
+            context.push(1 << 9);
+            context.push((GDT_USER_CODE * mem::size_of::<GdtEntry>()) | 3);
+            context.push(entry);
+            context.push(0);
+            context.push(context_userspace as usize);
         }
     });
 
@@ -103,138 +126,148 @@ pub fn execute_thread(context_ptr: *mut Context, entry: usize, mut args: Vec<Str
 
 /// Execute an executable
 pub fn execute(mut args: Vec<String>) -> Result<usize> {
-    let contexts = ::env().contexts.lock();
-    let current = try!(contexts.current());
+    let contexts = unsafe { &mut *::env().contexts.get() };
+    let current = try!(contexts.current_mut());
 
     let mut vec: Vec<u8> = Vec::new();
 
     let path = current.canonicalize(args.get(0).map_or("", |p| &p));
-    let mut url = try!(Url::from_str(&path)).to_cow();
     {
-        let mut resource = if let Ok(resource) = url.as_url().open() {
-            resource
-        } else {
-            let path = "file:/bin/".to_string() + args.get(0).map_or("", |p| &p);
-            url = try!(Url::from_str(&path)).to_owned().into_cow();
-            try!(url.as_url().open())
-        };
+        let mut resource = try!(::env().open(&path, O_RDONLY));
 
         // Hack to allow file scheme to find memory in context's memory space
         unsafe {
-            let heap = &mut *current.heap.get();
+            let mmap = &mut *current.mmap.get();
 
-            let virtual_size = 65536;
-            let virtual_address = heap.next_mem();
+            let virtual_size = 1024*1024;
 
             let physical_address = memory::alloc_aligned(virtual_size, 4096);
             if physical_address == 0 {
                 return Err(Error::new(ENOMEM));
             }
 
-            let mut memory = ContextMemory {
-                physical_address: physical_address,
-                virtual_address: virtual_address,
-                virtual_size: virtual_size,
-                writeable: true,
-                allocated: true,
-            };
+            let virtual_address = try!(mmap.add_mem(physical_address, virtual_size, true, true));
 
-            memory.map();
-
-            heap.memory.push(memory);
-
-            'reading: loop {
-                let mut bytes = slice::from_raw_parts_mut(virtual_address as *mut u8, virtual_size);
-                match resource.read(&mut bytes) {
-                    Ok(0) => break 'reading,
-                    Ok(count) => vec.extend_from_slice(bytes.get_slice(.. count)),
-                    Err(err) => return Err(err)
+            for i in 0..mmap.memory.len() {
+                if mmap.memory[i].virtual_address == virtual_address {
+                    mmap.memory[i].map();
+                    break;
                 }
             }
 
-            let mut memory = heap.memory.pop().unwrap();
+            let mut read_loop = || -> Result<usize> {
+                loop {
+                    let mut bytes = slice::from_raw_parts_mut(virtual_address as *mut u8, virtual_size);
+                    match resource.read(&mut bytes) {
+                        Ok(0) => return Ok(0),
+                        Ok(count) => vec.extend_from_slice(bytes.get_slice(.. count)),
+                        Err(err) => return Err(err)
+                    }
+                }
+            };
 
-            memory.unmap();
+            let res = read_loop();
+
+            for i in 0..mmap.memory.len() {
+                if mmap.memory[i].virtual_address == virtual_address {
+                    mmap.memory.remove(i).unmap();
+                    break;
+                }
+            }
+
+            try!(res);
         }
     }
 
     if vec.starts_with(b"#!") {
         if let Some(mut arg) = args.get_mut(0) {
-            *arg = url.as_url().to_string();
+            *arg = path.to_string();
         }
 
         let line = unsafe { str::from_utf8_unchecked(&vec[2..]) }.lines().next().unwrap_or("");
         let mut i = 0;
         for arg in line.trim().split(' ') {
-            if ! arg.is_empty() {
-                args.insert(i, arg.to_string());
+            if !arg.is_empty() {
+                args.insert(i, arg.to_owned());
                 i += 1;
             }
         }
         if i == 0 {
-            args.insert(i, "/bin/sh".to_string());
+            args.insert(i, "/bin/sh".to_owned());
         }
         execute(args)
     } else {
         match Elf::from(&vec) {
             Ok(executable) => {
                 let entry = unsafe { executable.entry() };
-                let mut memory = Vec::new();
-                unsafe {
-                    for segment in executable.load_segment().iter() {
-                        let virtual_address = segment.vaddr as usize;
-                        let virtual_size = segment.mem_len as usize;
+                let segments = unsafe { executable.load_segments() };
 
-                        let offset = virtual_address % 4096;
+                if entry > 0 && ! segments.is_empty() {
+                    unsafe { current.unmap() };
 
-                        let physical_address = memory::alloc_aligned(virtual_size + offset, 4096);
+                    current.name = path.to_string().into();
+                    current.cwd = Arc::new(UnsafeCell::new(unsafe { (*current.cwd.get()).clone() }));
 
-                        if physical_address > 0 {
-                            //TODO: Use paging to fix collisions
-                            // Copy progbits
-                            ::memcpy((physical_address + offset) as *mut u8,
-                                     (executable.data.as_ptr() as usize + segment.off as usize) as *const u8,
-                                     segment.file_len as usize);
+                    current.image = Arc::new(UnsafeCell::new(ContextZone::new(CONTEXT_IMAGE_ADDR, CONTEXT_IMAGE_SIZE)));
+                    current.heap = Arc::new(UnsafeCell::new(ContextZone::new(CONTEXT_HEAP_ADDR, CONTEXT_HEAP_SIZE)));
+                    current.mmap = Arc::new(UnsafeCell::new(ContextZone::new(CONTEXT_MMAP_ADDR, CONTEXT_MMAP_SIZE)));
+                    current.env_vars = Arc::new(UnsafeCell::new(unsafe { (*current.env_vars.get()).clone() }));
 
-                            memory.push(ContextMemory {
+                    {
+                        let image = unsafe { &mut *current.image.get() };
+
+                        for segment in segments.iter() {
+                            let virtual_address = segment.p_vaddr as usize;
+                            let virtual_size = segment.p_memsz as usize;
+
+                            let offset = virtual_address % 4096;
+
+                            let physical_address = unsafe { memory::alloc_aligned(virtual_size + offset, 4096) };
+
+                            if physical_address == 0 {
+                                panic!("OOM in exec");
+                            }
+
+                            let mut memory = ContextMemory {
                                 physical_address: physical_address,
                                 virtual_address: virtual_address - offset,
                                 virtual_size: virtual_size + offset,
-                                writeable: segment.flags & 2 == 2,
+                                writeable: true,
                                 allocated: true,
-                            });
+                            };
+
+                            unsafe { memory.map() };
+
+                            // Copy progbits
+                            unsafe {
+                                ::memcpy(virtual_address as *mut u8,
+                                        executable.data.as_ptr().offset(segment.p_offset as isize),
+                                        segment.p_filesz as usize)
+                            };
+
+                            unsafe { memory.unmap() };
+
+                            memory.writeable = segment.p_flags & 2 == 2;
+
+                            if segment.p_type == 1 {
+                                image.memory.push(memory);
+                            } else if segment.p_type == 7 {
+                                unsafe { *current.tls_master.get() = Some(memory) };
+                            }
                         }
                     }
-                }
-
-                if entry > 0 && ! memory.is_empty() {
-                    let mut contexts = ::env().contexts.lock();
-                    let mut context = try!(contexts.current_mut());
 
                     //debugln!("{}: {}: execute {}", context.pid, context.name, url.string);
 
-                    context.name = url.as_url().to_string();
-                    context.cwd = Arc::new(UnsafeCell::new(unsafe { (*context.cwd.get()).clone() }));
+                    unsafe { current.map() };
 
-                    unsafe { context.unmap() };
-
-                    let mut image = ContextZone::new(CONTEXT_IMAGE_ADDR, CONTEXT_IMAGE_SIZE);
-                    image.memory = memory;
-
-                    context.image = Arc::new(UnsafeCell::new(image));
-                    context.heap = Arc::new(UnsafeCell::new(ContextZone::new(CONTEXT_HEAP_ADDR, CONTEXT_HEAP_SIZE)));
-                    context.mmap = Arc::new(UnsafeCell::new(ContextZone::new(CONTEXT_MMAP_ADDR, CONTEXT_MMAP_SIZE)));
-                    context.env_vars = Arc::new(UnsafeCell::new(unsafe { (*context.env_vars.get()).clone() }));
-
-                    unsafe { context.map() };
-
-                    execute_thread(context.deref_mut(), entry, args);
+                    execute_thread(current.deref_mut(), entry, args);
                 } else {
                     Err(Error::new(ENOEXEC))
                 }
             },
             Err(msg) => {
-                debugln!("execute: failed to exec '{:?}': {}", url, msg);
+                debugln!("execute: failed to exec '{:?}': {}", path, msg);
                 Err(Error::new(ENOEXEC))
             }
         }

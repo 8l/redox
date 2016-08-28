@@ -1,27 +1,12 @@
 #![crate_name="kernel"]
 #![crate_type="staticlib"]
-#![feature(alloc)]
-#![feature(allocator)]
-#![feature(arc_counts)]
-#![feature(asm)]
-#![feature(box_syntax)]
-#![feature(collections)]
-#![feature(const_fn)]
-#![feature(core_intrinsics)]
-#![feature(fnbox)]
-#![feature(fundamental)]
-#![feature(lang_items)]
-#![feature(naked_functions)]
-#![feature(unboxed_closures)]
-#![feature(unsafe_no_drop_flag)]
-#![feature(unwind_attributes)]
-#![feature(zero_one)]
-#![feature(collections_range)]
+#![feature(alloc, allocator, arc_counts, asm, box_syntax, collections, const_fn, core_intrinsics,
+           fnbox, fundamental, lang_items, naked_functions, unboxed_closures, unsafe_no_drop_flag,
+           unwind_attributes, collections_range, question_mark, type_ascription)]
 #![no_std]
 
-#![allow(deprecated)]
 #![deny(warnings)]
-//#![deny(missing_docs)]
+// #![deny(missing_docs)]
 
 #[macro_use]
 extern crate alloc;
@@ -34,20 +19,24 @@ extern crate collections;
 
 extern crate system;
 
+extern crate goblin;
+
 use acpi::Acpi;
 
 use alloc::boxed::Box;
 
-use arch::context::{context_switch, Context};
+use arch::context::{context_switch, Context, ContextFile};
+use arch::gdt::{GdtDescriptor, GdtEntry};
+use arch::idt::{IdtDescriptor, IdtEntry};
 use arch::memory;
 use arch::paging::Page;
 use arch::regs::Regs;
 use arch::tss::Tss;
 
-use collections::Vec;
+use collections::{String, Vec};
 use collections::string::ToString;
 
-use core::{mem, usize};
+use core::{mem, slice, usize};
 
 use common::time::Duration;
 
@@ -55,28 +44,24 @@ use drivers::pci;
 use drivers::io::{Io, Pio};
 use drivers::ps2::*;
 use drivers::rtc::*;
-use drivers::serial::*;
+use drivers::serial::{self, Serial};
 
 use env::Environment;
 
 use graphics::display;
 
-use network::schemes::{ArpScheme, EthernetScheme, IcmpScheme, IpScheme, TcpScheme, UdpScheme};
+use network::schemes::{ArpScheme, EthernetScheme, IcmpScheme, IpScheme, NetConfigScheme, TcpScheme, UdpScheme};
 
-use schemes::context::ContextScheme;
 use schemes::debug::DebugScheme;
 use schemes::disk::DiskScheme;
 use schemes::display::DisplayScheme;
 use schemes::env::EnvScheme;
-//use schemes::file::FileScheme;
 use schemes::initfs::InitFsScheme;
-use schemes::interrupt::InterruptScheme;
-use schemes::memory::MemoryScheme;
-use schemes::syslog::SyslogScheme;
-use schemes::test::TestScheme;
+use schemes::pty::PtyScheme;
+use schemes::sys::SysScheme;
 
+use syscall::process::exit;
 use syscall::execute::execute;
-use syscall::{do_sys_chdir, do_sys_exit, do_sys_open, syscall_handle};
 
 pub use externs::*;
 
@@ -181,12 +166,23 @@ pub mod syscall;
 /// This modules contains drivers and other tools for USB.
 pub mod usb;
 
-/// The TTS pointer.
+/// The GDT pointer.
+///
+/// This static contains a mutable pointer to the GDT (global descriptor table)
+pub static mut GDT_PTR: Option<&'static mut [GdtEntry]> = None;
+
+/// The IDT pointer.
+///
+/// This static contains a mutable pointer to the IDT (interrupt descriptor table)
+pub static mut IDT_PTR: Option<&'static mut [IdtEntry]> = None;
+
+/// The TSS pointer.
 ///
 /// This static contains a mutable pointer to the TSS (task state segment), which is a data
 /// structure used on x86-based architectures for holding information about a specific task. See
 /// `Tss` for more information.
 pub static mut TSS_PTR: Option<&'static mut Tss> = None;
+
 /// The environment pointer.
 ///
 /// The pointer to the kernel environment, holding the state of the kernel.
@@ -222,8 +218,8 @@ fn idle_loop() {
 
         let mut halt = true;
 
-        for context in env().contexts.lock().iter().skip(1) {
-            if !context.blocked {
+        for context in unsafe { & *env().contexts.get() }.iter().skip(1) {
+            if context.blocked == 0 {
                 halt = false;
                 break;
             }
@@ -232,7 +228,7 @@ fn idle_loop() {
         if halt {
             unsafe { asm!("sti ; hlt" : : : : "intel", "volatile"); }
         } else {
-            unsafe { asm!("sti ; nop" : : : : "intel", "volatile"); }
+            unsafe { asm!("sti ; nop ; cli" : : : : "intel", "volatile"); }
             unsafe { context_switch(); }
         }
     }
@@ -268,7 +264,7 @@ static BSS_TEST_NONZERO: usize = !0;
 /// on.
 ///
 /// Note that this will not start the event loop.
-unsafe fn init(tss_data: usize) {
+unsafe fn init(gdt_ptr: *mut GdtDescriptor, idt_ptr: *mut IdtDescriptor, tss_ptr: *mut Tss) {
 
     // Test
     assume!(true);
@@ -290,6 +286,9 @@ unsafe fn init(tss_data: usize) {
     // Setup paging, this allows for memory allocation
     Page::init();
     memory::cluster_init();
+
+    // Get the serial information
+    serial::bda_init();
 
     // Get the VBE information before unmapping the first megabyte
     display::vbe_init();
@@ -346,98 +345,151 @@ unsafe fn init(tss_data: usize) {
         }
     }
 
-    TSS_PTR = Some(&mut *(tss_data as *mut Tss));
+    GDT_PTR = Some(slice::from_raw_parts_mut((&*gdt_ptr).ptr as *mut GdtEntry, ((&*gdt_ptr).size as usize) + 1));
+    IDT_PTR = Some(slice::from_raw_parts_mut((&*idt_ptr).ptr as *mut IdtEntry, ((&*idt_ptr).size as usize) + 1));
+    TSS_PTR = Some(&mut *tss_ptr);
     ENV_PTR = Some(&mut *Box::into_raw(Environment::new()));
 
     match ENV_PTR {
         Some(ref mut env) => {
-            env.contexts.lock().push(Context::root());
+            (&mut *env.contexts.get()).push(Context::root());
 
-            env.console.lock().draw = true;
+            let mut serial = Serial::new(0x3F8, 0x4);
 
-            debugln!("\x1B[1mRedox {} bits\x1B[0m", mem::size_of::<usize>() * 8);
-            debugln!("  * text={:X}:{:X} rodata={:X}:{:X}",
+            let mut term_columns;
+            let mut term_lines;
+            match (& *::env().console.get()).display {
+                Some(ref display) => {
+                    term_columns = format!("{}", display.width/8);
+                    term_lines = format!("{}", display.height/16);
+                },
+                None => {
+                    term_columns = String::new();
+                    term_lines = String::new();
+                    //Magic for getting serial size
+                    serial.write("ANSI Terminal Size:\n\x1B[s\x1B[9999;9999f\x1B[6n\x1B[u".as_bytes());
+                    let mut escaped = 0;
+                    let mut param = 0;
+                    loop {
+                        let c = serial.readb() as char;
+                        match c {
+                            '\0' => break,
+                            '\x1B' if escaped == 0 => escaped = 1,
+                            '[' if escaped == 1 => escaped = 2,
+                            '0' ... '9' if escaped == 2 => if param == 0 {
+                                term_lines.push(c);
+                            } else if param == 1 {
+                                term_columns.push(c);
+                            },
+                            ';' if escaped == 2 => param += 1,
+                            'R' if escaped == 2 => break,
+                            _ => {
+                                escaped = 0;
+                                param = 0;
+                            }
+                        }
+                    }
+                    serial.write(term_columns.as_bytes());
+                    serial.write(", ".as_bytes());
+                    serial.write(term_lines.as_bytes());
+                    serial.write("\n".as_bytes());
+                }
+            }
+
+            (&mut *env.schemes.get()).push(serial);
+
+            (&mut *env.console.get()).draw = true;
+
+            syslog_info!("\x1B[1mRedox {} bits\x1B[0m", mem::size_of::<usize>() * 8);
+            syslog_info!("  * text={:X}:{:X} rodata={:X}:{:X}",
                     & __text_start as *const u8 as usize, & __text_end as *const u8 as usize,
                     & __rodata_start as *const u8 as usize, & __rodata_end as *const u8 as usize);
-            debugln!("  * data={:X}:{:X} bss={:X}:{:X}",
+            syslog_info!("  * data={:X}:{:X} bss={:X}:{:X}",
                     & __data_start as *const u8 as usize, & __data_end as *const u8 as usize,
                     & __bss_start as *const u8 as usize, & __bss_end as *const u8 as usize);
 
             if let Some(acpi) = Acpi::new() {
-                env.schemes.lock().push(acpi);
+                (&mut *env.schemes.get()).push(acpi);
             }
 
-            *(env.clock_realtime.lock()) = Rtc::new().time();
+            *env.clock_realtime.get() = Rtc::new().time();
 
-            env.schemes.lock().push(Ps2::new());
-            env.schemes.lock().push(Serial::new(0x3F8, 0x4));
+            (&mut *env.schemes.get()).push(Ps2::new());
 
             pci::pci_init(env);
 
-            env.schemes.lock().push(DebugScheme::new());
-            env.schemes.lock().push(InitFsScheme::new());
-            env.schemes.lock().push(box ContextScheme);
-            env.schemes.lock().push(box DisplayScheme);
-            env.schemes.lock().push(box EnvScheme);
-            env.schemes.lock().push(box InterruptScheme);
-            env.schemes.lock().push(box MemoryScheme);
-            env.schemes.lock().push(box SyslogScheme);
-            env.schemes.lock().push(box TestScheme);
+            (&mut *env.schemes.get()).push(DebugScheme::new());
 
-            //TODO: Do not do this! Find a better way
-            let mut disks = Vec::new();
-            disks.append(&mut env.disks.lock());
-            env.schemes.lock().push(DiskScheme::new(disks));
+            (&mut *env.schemes.get()).push(box DiskScheme);
+
+            (&mut *env.schemes.get()).push(box DisplayScheme);
+
+            (&mut *env.schemes.get()).push(InitFsScheme::new());
+
+            (&mut *env.schemes.get()).push(box EnvScheme);
+
+            (&mut *env.schemes.get()).push(PtyScheme::new());
+
+            (&mut *env.schemes.get()).push(SysScheme::new());
 
             /*
             let mut nics = Vec::new();
             nics.append(&mut env.nics.lock());
-            env.schemes.lock().push(NetworkScheme::new(nics));
+            (&mut *env.schemes.get()).push(NetworkScheme::new(nics));
             */
 
-            env.schemes.lock().push(box EthernetScheme);
-            //env.schemes.lock().push(box ArpScheme);
-            //env.schemes.lock().push(box IcmpScheme);
-            env.schemes.lock().push(box IpScheme {
+            (&mut *env.schemes.get()).push(box NetConfigScheme);
+            (&mut *env.schemes.get()).push(box EthernetScheme);
+            //(&mut *env.schemes.get()).push(box ArpScheme);
+            //(&mut *env.schemes.get()).push(box IcmpScheme);
+            (&mut *env.schemes.get()).push(box IpScheme {
                 arp: Vec::new()
             });
-            env.schemes.lock().push(box TcpScheme);
-            env.schemes.lock().push(box UdpScheme);
+            (&mut *env.schemes.get()).push(box TcpScheme);
+            (&mut *env.schemes.get()).push(box UdpScheme);
 
-            Context::spawn("karp".to_string(),
-            box move || {
-                ArpScheme::reply_loop();
-            });
+            Context::spawn("karp".into(),
+                           box move || {
+                               ArpScheme::reply_loop();
+                           });
 
-            Context::spawn("kicmp".to_string(),
-            box move || {
-                IcmpScheme::reply_loop();
-            });
+            Context::spawn("kicmp".into(),
+                           box move || {
+                               IcmpScheme::reply_loop();
+                           });
 
-            env.contexts.lock().enabled = true;
+            (&mut *env.contexts.get()).enabled = true;
 
-            Context::spawn("kinit".to_string(),
-            box move || {
+            Context::spawn("kinit".into(),
+                           box move || {
                 {
-                    let wd_c = "initfs:/\0";
-                    do_sys_chdir(wd_c.as_ptr()).unwrap();
+                    let mut contexts = &mut *::env().contexts.get();
+                    let current = contexts.current_mut().unwrap();
 
-                    let stdio_c = "debug:\0";
-                    do_sys_open(stdio_c.as_ptr(), 0).unwrap();
-                    do_sys_open(stdio_c.as_ptr(), 0).unwrap();
-                    do_sys_open(stdio_c.as_ptr(), 0).unwrap();
+                    *current.cwd.get() = "initfs:/".to_string();
 
-                    if let Some(ref display) = ::env().console.lock().display {
-                        let mut contexts = ::env().contexts.lock();
-                        let current = contexts.current_mut().unwrap();
-                        current.set_env_var("COLUMNS", &format!("{}", display.width/8)).unwrap();
-                        current.set_env_var("LINES", &format!("{}", display.height/16)).unwrap();
-                    }
+                    (*current.files.get()).push(ContextFile {
+                        fd: 0,
+                        resource: ::env().open("debug:", 0).unwrap(),
+                    });
+                    (*current.files.get()).push(ContextFile {
+                        fd: 1,
+                        resource: ::env().open("debug:", 0).unwrap(),
+                    });
+                    (*current.files.get()).push(ContextFile {
+                        fd: 2,
+                        resource: ::env().open("debug:", 0).unwrap(),
+                    });
+
+                    current.set_env_var("PATH", "file:/bin").unwrap();
+                    current.set_env_var("COLUMNS", &term_columns).unwrap();
+                    current.set_env_var("LINES", &term_lines).unwrap();
+                    current.set_env_var("TTY", "debug:").unwrap();
                 }
 
                 syslog_info!("The kernel has finished booting. Running /bin/init");
                 if let Err(err) = execute(vec!["initfs:/bin/init".to_string()]) {
-                    debugln!("kernel: init: failed to execute: {}", err);
+                    syslog_info!("kernel: init: failed to execute: {}", err);
                 }
             });
         },
@@ -453,17 +505,21 @@ pub extern "cdecl" fn kernel(interrupt: usize, mut regs: &mut Regs) {
     macro_rules! exception_inner {
         ($name:expr) => ({
             {
-                let contexts = ::env().contexts.lock();
+                let contexts = unsafe { &mut *::env().contexts.get() };
                 if let Ok(context) = contexts.current() {
-                    debugln!("PID {}: {}", context.pid, context.name);
+                    syslog_info!("PID {}: {}", context.pid, context.name);
+
+                    if let Some(current_syscall) = context.current_syscall {
+                        syslog_info!("  SYS {:X}: {} {} {:X} {:X} {:X}", current_syscall.0, current_syscall.1, syscall::name(current_syscall.1), current_syscall.2, current_syscall.3, current_syscall.4);
+                    }
                 }
             }
 
-            debugln!("  INT {:X}: {}", interrupt, $name);
-            debugln!("    CS:  {:08X}    IP:  {:08X}    FLG: {:08X}", regs.cs, regs.ip, regs.flags);
-            debugln!("    SS:  {:08X}    SP:  {:08X}    BP:  {:08X}", regs.ss, regs.sp, regs.bp);
-            debugln!("    AX:  {:08X}    BX:  {:08X}    CX:  {:08X}    DX:  {:08X}", regs.ax, regs.bx, regs.cx, regs.dx);
-            debugln!("    DI:  {:08X}    SI:  {:08X}", regs.di, regs.di);
+            syslog_info!("  INT {:X}: {}", interrupt, $name);
+            syslog_info!("    CS:  {:08X}    IP:  {:08X}    FLG: {:08X}", regs.cs, regs.ip, regs.flags);
+            syslog_info!("    SS:  {:08X}    SP:  {:08X}    BP:  {:08X}", regs.ss, regs.sp, regs.bp);
+            syslog_info!("    AX:  {:08X}    BX:  {:08X}    CX:  {:08X}    DX:  {:08X}", regs.ax, regs.bx, regs.cx, regs.dx);
+            syslog_info!("    DI:  {:08X}    SI:  {:08X}", regs.di, regs.di);
 
             let cr0: usize;
             let cr2: usize;
@@ -475,7 +531,7 @@ pub extern "cdecl" fn kernel(interrupt: usize, mut regs: &mut Regs) {
                 asm!("mov $0, cr3" : "=r"(cr3) : : : "intel", "volatile");
                 asm!("mov $0, cr4" : "=r"(cr4) : : : "intel", "volatile");
             }
-            debugln!("    CR0: {:08X}    CR2: {:08X}    CR3: {:08X}    CR4: {:08X}", cr0, cr2, cr3, cr4);
+            syslog_info!("    CR0: {:08X}    CR2: {:08X}    CR3: {:08X}    CR4: {:08X}", cr0, cr2, cr3, cr4);
 
             let mut fsw: usize = 0;
             let mut fcw: usize = 0;
@@ -483,11 +539,54 @@ pub extern "cdecl" fn kernel(interrupt: usize, mut regs: &mut Regs) {
                 asm!("fnstsw $0" : "=*m"(&mut fsw) : : : "intel", "volatile");
                 asm!("fnstcw $0" : "=*m"(&mut fcw) : : : "intel", "volatile");
             }
-            debugln!("    FSW: {:08X}    FCW: {:08X}", fsw, fcw);
+            syslog_info!("    FSW: {:08X}    FCW: {:08X}", fsw, fcw);
+
+            if interrupt == 0xE {
+                let contexts = unsafe { &mut *::env().contexts.get() };
+                if let Ok(context) = contexts.current() {
+                    if let Some(ref stack) = context.stack {
+                        if cr2 >= stack.virtual_address && cr2 <= stack.virtual_address + stack.virtual_size {
+                            syslog_info!("    STACK {:08X}", cr2 - stack.virtual_address + stack.physical_address);
+                            syslog_info!("    {:08X}:{:08X} at {:08X}", stack.virtual_address, stack.virtual_address + stack.virtual_size, stack.physical_address);
+                        }
+                    }
+
+                    if let Some(ref tls) = context.tls {
+                        if cr2 >= tls.virtual_address && cr2 <= tls.virtual_address + tls.virtual_size {
+                            syslog_info!("    TLS {:08X}", cr2 - tls.virtual_address + tls.physical_address);
+                            syslog_info!("    {:08X}:{:08X} at {:08X}", tls.virtual_address, tls.virtual_address + tls.virtual_size, tls.physical_address);
+                        }
+                    }
+
+                    if let Some(address) = unsafe { (*context.image.get()).translate(cr2, 0) } {
+                        syslog_info!("    IMAGE {:08X}", address);
+
+                        for mem in unsafe { (*context.image.get()).memory.iter() } {
+                            syslog_info!("    {:08X}:{:08X} at {:08X}", mem.virtual_address, mem.virtual_address + mem.virtual_size, mem.physical_address);
+                        }
+                    }
+
+                    if let Some(address) = unsafe { (*context.heap.get()).translate(cr2, 0) } {
+                        syslog_info!("    HEAP {:08X}", address);
+
+                        for mem in unsafe { (*context.heap.get()).memory.iter() } {
+                            syslog_info!("    {:08X}:{:08X} at {:08X}", mem.virtual_address, mem.virtual_address + mem.virtual_size, mem.physical_address);
+                        }
+                    }
+
+                    if let Some(address) = unsafe { (*context.mmap.get()).translate(cr2, 0) } {
+                        syslog_info!("    MMAP {:08X}", address);
+
+                        for mem in unsafe { (*context.mmap.get()).memory.iter() } {
+                            syslog_info!("    {:08X}:{:08X} at {:08X}", mem.virtual_address, mem.virtual_address + mem.virtual_size, mem.physical_address);
+                        }
+                    }
+                }
+            }
 
             /* TODO: Stack dump
             {
-                let contexts = ::env().contexts.lock();
+                let contexts = unsafe { & *::env().contexts.get() };
                 if let Ok(context) = contexts.current() {
                     let sp = regs.sp as *const usize;
                     for y in -15..16 {
@@ -515,7 +614,7 @@ pub extern "cdecl" fn kernel(interrupt: usize, mut regs: &mut Regs) {
             exception_inner!($name);
 
             loop {
-                do_sys_exit(usize::MAX);
+                exit(127);
             }
         })
     };
@@ -531,31 +630,31 @@ pub extern "cdecl" fn kernel(interrupt: usize, mut regs: &mut Regs) {
             //regs.ss = regs.error;
 
             exception_inner!($name);
-            debugln!("    ERR: {:08X}", error);
+            syslog_info!("    ERR: {:08X}", error);
 
             loop {
-                do_sys_exit(usize::MAX);
+                exit(127);
             }
         })
     };
 
     // Do not catch init interrupt
     if interrupt < 0xFF {
-        env().interrupts.lock()[interrupt as usize] += 1;
+        unsafe { (&mut *env().interrupts.get())[interrupt as usize] += 1 };
     }
 
     match interrupt {
         0x20 => {
             {
-                let mut clock_monotonic = env().clock_monotonic.lock();
+                let mut clock_monotonic = unsafe { &mut *env().clock_monotonic.get() };
                 *clock_monotonic = *clock_monotonic + PIT_DURATION;
             }
             {
-                let mut clock_realtime = env().clock_realtime.lock();
+                let mut clock_realtime = unsafe { &mut *env().clock_realtime.get() };
                 *clock_realtime = *clock_realtime + PIT_DURATION;
             }
 
-            if let Ok(mut current) = env().contexts.lock().current_mut() {
+            if let Ok(mut current) = unsafe { &mut *env().contexts.get() }.current_mut() {
                 current.time += 1;
             }
 
@@ -564,10 +663,10 @@ pub extern "cdecl" fn kernel(interrupt: usize, mut regs: &mut Regs) {
         i @ 0x21 ... 0x2F => {
             env().on_irq(i as u8 - 0x20);
         },
-        0x80 => syscall_handle(regs),
+        0x80 => syscall::handle(regs),
         0xFF => {
             unsafe {
-                init(regs.ax);
+                init(regs.ax as *mut GdtDescriptor, regs.bx as *mut IdtDescriptor, regs.cx as *mut Tss);
                 idle_loop();
             }
         },

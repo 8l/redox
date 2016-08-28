@@ -9,17 +9,17 @@ use core::mem::size_of;
 use core::ops::DerefMut;
 use core::{ptr, slice};
 
-use arch::context::{Context, ContextMemory};
+use arch::context::Context;
 
 use sync::{WaitMap, WaitQueue};
 
-use system::error::{Error, Result, EBADF, EFAULT, EINVAL, ENODEV, ESPIPE};
+use system::error::{Error, Result, EFAULT, EINVAL, ENODEV, ESPIPE};
 use system::scheme::Packet;
-use system::syscall::{SYS_CLOSE, SYS_FPATH, SYS_FSTAT, SYS_FSYNC, SYS_FTRUNCATE,
+use system::syscall::{SYS_CLOSE, SYS_DUP, SYS_FPATH, SYS_FSTAT, SYS_FSYNC, SYS_FTRUNCATE,
                     SYS_OPEN, SYS_LSEEK, SEEK_SET, SEEK_CUR, SEEK_END, SYS_MKDIR,
-                    SYS_READ, SYS_WRITE, SYS_RMDIR, SYS_STAT, SYS_UNLINK, Stat};
+                    SYS_READ, SYS_WRITE, SYS_RMDIR, SYS_UNLINK, Stat};
 
-use super::{Resource, ResourceSeek, KScheme, Url};
+use super::{Resource, ResourceSeek, KScheme};
 
 struct SchemeInner {
     name: String,
@@ -51,14 +51,19 @@ impl SchemeInner {
             }
             scheme.next_id.set(next_id);
 
+            // debugln!("{} {}: {} {} {:X} {:X} {:X}", scheme.name, id, a, ::syscall::name(a), b, c, d);
+
             scheme.todo.send(Packet {
                 id: id,
                 a: a,
                 b: b,
                 c: c,
                 d: d
-            });
-            Error::demux(scheme.done.receive(&id).0)
+            }, "SchemeInner::call todo");
+
+            let res = Error::demux(scheme.done.receive(&id, "SchemeInner::call done").0);
+            // debugln!("{} {}: {} {} {:X} {:X} {:X} = {:?}", scheme.name, id, a, ::syscall::name(a), b, c, d, res);
+            res
         } else {
             Err(Error::new(ENODEV))
         }
@@ -71,15 +76,7 @@ impl SchemeInner {
             }
             unsafe {
                 let mmap = &mut *(*scheme.context).mmap.get();
-                let virtual_address = mmap.next_mem();
-                mmap.memory.push(ContextMemory {
-                    physical_address: physical_address,
-                    virtual_address: virtual_address,
-                    virtual_size: size,
-                    writeable: writeable,
-                    allocated: false,
-                });
-                return Ok(virtual_address);
+                return mmap.add_mem(physical_address, size, writeable, false);
             }
         } else {
             return Err(Error::new(ENODEV));
@@ -101,7 +98,7 @@ impl SchemeInner {
 
 impl Drop for SchemeInner {
     fn drop(&mut self) {
-        ::env().schemes.lock().retain(|scheme| scheme.scheme() != self.name);
+        unsafe { &mut *::env().schemes.get() }.retain(|scheme| scheme.scheme() != self.name);
     }
 }
 
@@ -127,12 +124,16 @@ impl SchemeResource {
 impl Resource for SchemeResource {
     /// Duplicate the resource
     fn dup(&self) -> Result<Box<Resource>> {
-        Err(Error::new(EBADF))
+        let file_id = try!(self.call(SYS_DUP, self.file_id, 0, 0));
+        Ok(Box::new(SchemeResource {
+            inner: self.inner.clone(),
+            file_id: file_id
+        }))
     }
 
-    /// Return the url of this resource
+    /// Return the URL of this resource
     fn path(&self, buf: &mut [u8]) -> Result <usize> {
-        let contexts = ::env().contexts.lock();
+        let contexts = unsafe { & *::env().contexts.get() };
         let current = try!(contexts.current());
         if let Ok(physical_address) = current.translate(buf.as_mut_ptr() as usize, buf.len()) {
             let offset = physical_address % 4096;
@@ -154,7 +155,7 @@ impl Resource for SchemeResource {
 
     /// Read data to buffer
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        let contexts = ::env().contexts.lock();
+        let contexts = unsafe { & *::env().contexts.get() };
         let current = try!(contexts.current());
         if let Ok(physical_address) = current.translate(buf.as_mut_ptr() as usize, buf.len()) {
             let offset = physical_address % 4096;
@@ -176,7 +177,7 @@ impl Resource for SchemeResource {
 
     /// Write to resource
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        let contexts = ::env().contexts.lock();
+        let contexts = unsafe { & *::env().contexts.get() };
         let current = try!(contexts.current());
         if let Ok(physical_address) = current.translate(buf.as_ptr() as usize, buf.len()) {
             let offset = physical_address % 4096;
@@ -185,7 +186,7 @@ impl Resource for SchemeResource {
 
             let result = self.call(SYS_WRITE, self.file_id, virtual_address + offset, buf.len());
 
-            //debugln!("Write {:X} mapped from {:X} to {:X} offset {} length {} size {} result {:?}", physical_address, buf.as_ptr() as usize, virtual_address + offset, offset, buf.len(), virtual_size, result);
+            // debugln!("Write {:X} mapped from {:X} to {:X} offset {} length {} result {:?}", physical_address, buf.as_ptr() as usize, virtual_address + offset, offset, buf.len(), result);
 
             self.release(virtual_address);
 
@@ -207,22 +208,22 @@ impl Resource for SchemeResource {
         self.call(SYS_LSEEK, self.file_id, offset, whence)
     }
 
-    /// Stat
-    fn stat(&self, stat: &mut Stat) -> Result<usize> {
+    /// Stat the resource
+    fn stat(&self, stat: &mut Stat) -> Result<()> {
         let buf = unsafe { slice::from_raw_parts_mut(stat as *mut Stat as *mut u8, size_of::<Stat>()) };
 
-        let contexts = ::env().contexts.lock();
+        let contexts = unsafe { & *::env().contexts.get() };
         let current = try!(contexts.current());
         if let Ok(physical_address) = current.translate(buf.as_mut_ptr() as usize, buf.len()) {
             let offset = physical_address % 4096;
 
             let virtual_address = try!(self.capture(physical_address - offset, buf.len() + offset, true));
 
-            let result = self.call(SYS_FSTAT, self.file_id, virtual_address + offset, buf.len());
+            let result = self.call(SYS_FSTAT, self.file_id, virtual_address + offset, 0);
 
             self.release(virtual_address);
 
-            result
+            result.and(Ok(()))
         } else {
             debugln!("{}:{} fault {:X} {}", file!(), line!(), buf.as_ptr() as usize, buf.len());
             Err(Error::new(EFAULT))
@@ -234,6 +235,7 @@ impl Resource for SchemeResource {
         self.call(SYS_FSYNC, self.file_id, 0, 0).and(Ok(()))
     }
 
+    /// Truncate the resource
     fn truncate(&mut self, len: usize) -> Result<()> {
         self.call(SYS_FTRUNCATE, self.file_id, len, 0).and(Ok(()))
     }
@@ -257,7 +259,7 @@ impl Resource for SchemeServerResource {
         })
     }
 
-    /// Return the url of this resource
+    /// Return the URL of this resource
     fn path(&self, buf: &mut [u8]) -> Result<usize> {
         let mut i = 0;
 
@@ -282,12 +284,12 @@ impl Resource for SchemeServerResource {
         if buf.len() >= size_of::<Packet>() {
             let mut i = 0;
 
-            let packet = self.inner.todo.receive();
+            let packet = self.inner.todo.receive("SchemeServerResource::read todo");
             unsafe { ptr::write(buf.as_mut_ptr().offset(i as isize) as *mut Packet, packet); }
             i += size_of::<Packet>();
 
             while i + size_of::<Packet>() <= buf.len() {
-                if let Some(packet) = self.inner.todo.inner.lock().pop_front() {
+                if let Some(packet) = unsafe { self.inner.todo.inner() }.pop_front() {
                     unsafe { ptr::write(buf.as_mut_ptr().offset(i as isize) as *mut Packet, packet); }
                     i += size_of::<Packet>();
                 } else {
@@ -308,7 +310,7 @@ impl Resource for SchemeServerResource {
 
             while i <= buf.len() - size_of::<Packet>() {
                 let packet = unsafe { & *(buf.as_ptr().offset(i as isize) as *const Packet) };
-                self.inner.done.send(packet.id, (packet.a, packet.b, packet.c, packet.d));
+                self.inner.done.send(packet.id, (packet.a, packet.b, packet.c, packet.d), "SchemeServerResource::write done");
                 i += size_of::<Packet>();
             }
 
@@ -341,7 +343,7 @@ pub struct Scheme {
 
 impl Scheme {
     pub fn new(name: &str) -> Result<(Box<Scheme>, Box<Resource>)> {
-        let mut contexts = ::env().contexts.lock();
+        let contexts = unsafe { &mut *::env().contexts.get() };
         let mut current = try!(contexts.current_mut());
         let server = box SchemeServerResource {
             inner: Arc::new(SchemeInner::new(name, current.deref_mut()))
@@ -375,12 +377,10 @@ impl KScheme for Scheme {
         &self.name
     }
 
-    fn open(&mut self, url: Url, flags: usize) -> Result<Box<Resource>> {
-        let c_str = url.to_string() + "\0";
+    fn open(&mut self, path: &str, flags: usize) -> Result<Box<Resource>> {
+        let virtual_address = try!(self.capture(path.as_ptr() as usize, path.len(), false));
 
-        let virtual_address = try!(self.capture(c_str.as_ptr() as usize, c_str.len(), false));
-
-        let result = self.call(SYS_OPEN, virtual_address, flags, 0);
+        let result = self.call(SYS_OPEN, virtual_address, path.len(), flags);
 
         self.release(virtual_address);
 
@@ -393,61 +393,30 @@ impl KScheme for Scheme {
         }
     }
 
-    fn mkdir(&mut self, url: Url, flags: usize) -> Result<()> {
-        let c_str = url.to_string() + "\0";
+    fn mkdir(&mut self, path: &str, flags: usize) -> Result<()> {
+        let virtual_address = try!(self.capture(path.as_ptr() as usize, path.len(), false));
 
-        let virtual_address = try!(self.capture(c_str.as_ptr() as usize, c_str.len(), false));
-
-        let result = self.call(SYS_MKDIR, virtual_address, flags, 0);
+        let result = self.call(SYS_MKDIR, virtual_address, path.len(), flags);
 
         self.release(virtual_address);
 
         result.and(Ok(()))
     }
 
-    fn rmdir(&mut self, url: Url) -> Result<()> {
-        let c_str = url.to_string() + "\0";
+    fn rmdir(&mut self, path: &str) -> Result<()> {
+        let virtual_address = try!(self.capture(path.as_ptr() as usize, path.len(), false));
 
-        let virtual_address = try!(self.capture(c_str.as_ptr() as usize, c_str.len(), false));
-
-        let result = self.call(SYS_RMDIR, virtual_address, 0, 0);
+        let result = self.call(SYS_RMDIR, virtual_address, path.len(), 0);
 
         self.release(virtual_address);
 
         result.and(Ok(()))
     }
 
-    fn stat(&mut self, url: Url, stat: &mut Stat) -> Result<()> {
-        let buf = unsafe { slice::from_raw_parts_mut(stat as *mut Stat as *mut u8, size_of::<Stat>()) };
+    fn unlink(&mut self, path: &str) -> Result<()> {
+        let virtual_address = try!(self.capture(path.as_ptr() as usize, path.len(), false));
 
-        let contexts = ::env().contexts.lock();
-        let current = try!(contexts.current());
-        if let Ok(physical_address) = current.translate(buf.as_mut_ptr() as usize, buf.len()) {
-            let offset = physical_address % 4096;
-
-            let virtual_address = try!(self.capture(physical_address - offset, buf.len() + offset, true));
-
-            let c_str = url.to_string() + "\0";
-
-            let c_str_address = try!(self.capture(c_str.as_ptr() as usize, c_str.len(), false));
-
-            let result = self.call(SYS_STAT, c_str_address, virtual_address + offset, buf.len());
-
-            self.release(c_str_address);
-
-            result.and(Ok(()))
-        } else {
-            debugln!("{}:{} fault {:X} {}", file!(), line!(), buf.as_ptr() as usize, buf.len());
-            Err(Error::new(EFAULT))
-        }
-    }
-
-    fn unlink(&mut self, url: Url) -> Result<()> {
-        let c_str = url.to_string() + "\0";
-
-        let virtual_address = try!(self.capture(c_str.as_ptr() as usize, c_str.len(), false));
-
-        let result = self.call(SYS_UNLINK, virtual_address, 0, 0);
+        let result = self.call(SYS_UNLINK, virtual_address, path.len(), 0);
 
         self.release(virtual_address);
 

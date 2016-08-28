@@ -1,8 +1,8 @@
-echo ############################
-echo ##  Redox OS has booted   ##
-echo ##  Press enter to login  ##
-echo ############################
-echo
+# DHCP, run in background
+dhcpd -b
 
 # Login process, handles debug console
 login
+
+# Comment out login, and uncomment the following to go straight to the GUI
+# orbital

@@ -1,10 +1,12 @@
 use boxed::Box;
-use core::mem;
+use collections::BTreeMap;
+use env;
 use fmt;
 use io::{Result, Read, Write};
+use mem;
 use os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use ops::DerefMut;
-use string::String;
+use string::{String, ToString};
 use core_collections::borrow::ToOwned;
 use vec::Vec;
 
@@ -100,8 +102,9 @@ impl Child {
 }
 
 pub struct Command {
-    pub path: String,
-    pub args: Vec<String>,
+    path: String,
+    args: Vec<String>,
+    env: BTreeMap<String, String>,
     stdin: Stdio,
     stdout: Stdio,
     stderr: Stdio,
@@ -113,6 +116,9 @@ impl fmt::Debug for Command {
         for arg in &self.args {
             try!(write!(f, " {:?}", arg));
         }
+        for (key, val) in &self.env {
+            try!(write!(f, " {:?}={:?}", key, val));
+        }
         Ok(())
     }
 }
@@ -122,6 +128,7 @@ impl Command {
         Command {
             path: path.to_owned(),
             args: Vec::new(),
+            env: BTreeMap::new(),
             stdin: Stdio::inherit(),
             stdout: Stdio::inherit(),
             stderr: Stdio::inherit(),
@@ -130,6 +137,11 @@ impl Command {
 
     pub fn arg(&mut self, arg: &str) -> &mut Command {
         self.args.push(arg.to_owned());
+        self
+    }
+
+    pub fn env(&mut self, key: &str, val: &str) -> &mut Command {
+        self.env.insert(key.to_owned(), val.to_owned());
         self
     }
 
@@ -164,7 +176,19 @@ impl Command {
     fn exec(&mut self, flags: usize) -> Result<Child> {
         let mut res = Box::new(0);
 
-        let path_c = self.path.to_owned() + "\0";
+        let path_c = if self.path.contains('/') {
+            self.path.to_owned() + "\0"
+        } else {
+            let mut path_env = super::env::var("PATH").unwrap_or(".".to_string());
+
+            if ! path_env.ends_with('/') {
+                path_env.push('/');
+            }
+
+            path_env.push_str(&self.path);
+
+            path_env + "\0"
+        };
 
         let mut args_vec: Vec<String> = Vec::new();
         for arg in self.args.iter() {
@@ -177,63 +201,82 @@ impl Command {
         }
         args_c.push(0 as *const u8);
 
+        let env = self.env.clone();
+
         let child_res = res.deref_mut() as *mut usize;
         let child_stderr = self.stderr.inner;
         let child_stdout = self.stdout.inner;
         let child_stdin = self.stdin.inner;
         let child_code = Box::new(move || -> Result<usize> {
-            match child_stderr {
+            let child_stderr_res = match child_stderr {
                 StdioType::Piped(read, write) => {
-                    try!(sys_close(read).map_err(|x| Error::from_sys(x)));
-                    try!(sys_close(2).map_err(|x| Error::from_sys(x)));
-                    try!(sys_dup(write).map_err(|x| Error::from_sys(x)));
-                    try!(sys_close(write).map_err(|x| Error::from_sys(x)));
+                    let _ = sys_close(read);
+                    let _ = sys_close(2);
+                    let dup_res = sys_dup(write).map_err(|x| Error::from_sys(x));
+                    let _ = sys_close(write);
+                    dup_res
                 },
                 StdioType::Raw(fd) => {
-                    try!(sys_close(2).map_err(|x| Error::from_sys(x)));
-                    try!(sys_dup(fd).map_err(|x| Error::from_sys(x)));
-                    try!(sys_close(fd).map_err(|x| Error::from_sys(x)));
+                    let _ = sys_close(2);
+                    let dup_res = sys_dup(fd).map_err(|x| Error::from_sys(x));
+                    let _ = sys_close(fd);
+                    dup_res
                 },
                 StdioType::Null => {
-                    try!(sys_close(2).map_err(|x| Error::from_sys(x)));
+                    let _ = sys_close(2);
+                    Ok(0)
                 },
-                _ => ()
-            }
+                _ => Ok(0)
+            };
 
-            match child_stdout {
+            let child_stdout_res = match child_stdout {
                 StdioType::Piped(read, write) => {
-                    try!(sys_close(read).map_err(|x| Error::from_sys(x)));
-                    try!(sys_close(1).map_err(|x| Error::from_sys(x)));
-                    try!(sys_dup(write).map_err(|x| Error::from_sys(x)));
-                    try!(sys_close(write).map_err(|x| Error::from_sys(x)));
+                    let _ = sys_close(read);
+                    let _ = sys_close(1);
+                    let dup_res = sys_dup(write).map_err(|x| Error::from_sys(x));
+                    let _ = sys_close(write);
+                    dup_res
                 },
                 StdioType::Raw(fd) => {
-                    try!(sys_close(1).map_err(|x| Error::from_sys(x)));
-                    try!(sys_dup(fd).map_err(|x| Error::from_sys(x)));
-                    try!(sys_close(fd).map_err(|x| Error::from_sys(x)));
+                    let _ = sys_close(1);
+                    let dup_res = sys_dup(fd).map_err(|x| Error::from_sys(x));
+                    let _ = sys_close(fd);
+                    dup_res
                 },
                 StdioType::Null => {
-                    try!(sys_close(1).map_err(|x| Error::from_sys(x)));
+                    let _ = sys_close(1);
+                    Ok(0)
                 },
-                _ => ()
-            }
+                _ => Ok(0)
+            };
 
-            match child_stdin {
+            let child_stdin_res = match child_stdin {
                 StdioType::Piped(read, write) => {
-                    try!(sys_close(write).map_err(|x| Error::from_sys(x)));
-                    try!(sys_close(0).map_err(|x| Error::from_sys(x)));
-                    try!(sys_dup(read).map_err(|x| Error::from_sys(x)));
-                    try!(sys_close(read).map_err(|x| Error::from_sys(x)));
+                    let _ = sys_close(write);
+                    let _ = sys_close(0);
+                    let dup_res = sys_dup(read).map_err(|x| Error::from_sys(x));
+                    let _ = sys_close(read);
+                    dup_res
                 },
                 StdioType::Raw(fd) => {
-                    try!(sys_close(0).map_err(|x| Error::from_sys(x)));
-                    try!(sys_dup(fd).map_err(|x| Error::from_sys(x)));
-                    try!(sys_close(fd).map_err(|x| Error::from_sys(x)));
+                    let _ = sys_close(0);
+                    let dup_res = sys_dup(fd).map_err(|x| Error::from_sys(x));
+                    let _ = sys_close(fd);
+                    dup_res
                 },
                 StdioType::Null => {
-                    try!(sys_close(0).map_err(|x| Error::from_sys(x)));
+                    let _ = sys_close(0);
+                    Ok(0)
                 },
-                _ => ()
+                _ => Ok(0)
+            };
+
+            let _ = try!(child_stderr_res);
+            let _ = try!(child_stdout_res);
+            let _ = try!(child_stdin_res);
+
+            for (key, val) in env.iter() {
+                env::set_var(key, val);
             }
 
             unsafe { sys_execve(path_c.as_ptr(), args_c.as_ptr()) }.map_err(|x| Error::from_sys(x))
@@ -253,45 +296,78 @@ impl Command {
                 // Must forget child_code to prevent double free
                 mem::forget(child_code);
                 if let Err(err) = SysError::demux(*res) {
+                    match self.stdin.inner {
+                        StdioType::Piped(read, write) => {
+                            let _ = sys_close(read);
+                            let _ = sys_close(write);
+                        },
+                        StdioType::Raw(fd) => {
+                            let _ = sys_close(fd);
+                        },
+                        _ => ()
+                    }
+
+                    match self.stdout.inner {
+                        StdioType::Piped(read, write) => {
+                            let _ = sys_close(write);
+                            let _ = sys_close(read);
+                        },
+                        StdioType::Raw(fd) => {
+                            let _ = sys_close(fd);
+                        },
+                        _ => ()
+                    }
+
+                    match self.stderr.inner {
+                        StdioType::Piped(read, write) => {
+                            let _ = sys_close(write);
+                            let _ = sys_close(read);
+                        },
+                        StdioType::Raw(fd) => {
+                            let _ = sys_close(fd);
+                        },
+                        _ => ()
+                    }
+
                     Err(Error::from_sys(err))
                 } else {
                     Ok(Child {
                         pid: pid,
                         stdin: match self.stdin.inner {
                             StdioType::Piped(read, write) => {
-                                try!(sys_close(read).map_err(|x| Error::from_sys(x)));
+                                let _ = sys_close(read);
                                 Some(ChildStdin {
                                     fd: write
                                 })
                             },
                             StdioType::Raw(fd) => {
-                                try!(sys_close(fd).map_err(|x| Error::from_sys(x)));
+                                let _ = sys_close(fd);
                                 None
                             },
                             _ => None
                         },
                         stdout: match self.stdout.inner {
                             StdioType::Piped(read, write) => {
-                                try!(sys_close(write).map_err(|x| Error::from_sys(x)));
+                                let _ = sys_close(write);
                                 Some(ChildStdout {
                                     fd: read
                                 })
                             },
                             StdioType::Raw(fd) => {
-                                try!(sys_close(fd).map_err(|x| Error::from_sys(x)));
+                                let _ = sys_close(fd);
                                 None
                             },
                             _ => None
                         },
                         stderr: match self.stderr.inner {
                             StdioType::Piped(read, write) => {
-                                try!(sys_close(write).map_err(|x| Error::from_sys(x)));
+                                let _ = sys_close(write);
                                 Some(ChildStderr {
                                     fd: read
                                 })
                             },
                             StdioType::Raw(fd) => {
-                                try!(sys_close(fd).map_err(|x| Error::from_sys(x)));
+                                let _ = sys_close(fd);
                                 None
                             },
                             _ => None
@@ -319,7 +395,7 @@ pub struct Stdio {
 impl Stdio {
     pub fn piped() -> Stdio {
         let mut fds = [0; 2];
-        if unsafe { sys_pipe2(fds.as_mut_ptr(), 0).is_ok() } {
+        if sys_pipe2(&mut fds, 0).is_ok() {
             Stdio {
                 inner: StdioType::Piped(fds[0], fds[1])
             }

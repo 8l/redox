@@ -1,6 +1,6 @@
-<img alt="Redox" height="90" src="img/logo.png">
+<img alt="Redox" height="90" src="https://github.com/redox-os/assets/raw/master/logo.png">
 
-**Redox** is an operating system written in pure Rust, designed to be modular and secure. The development blog can be found at http://www.redox-os.org.
+**Redox** is an operating system written in pure Rust, designed to be secure and free. The website can be found at https://www.redox-os.org.
 
 Documentation can be found [here](https://doc.redox-os.org/doc/std/).
 
@@ -21,13 +21,13 @@ Please make sure you use the **latest nightly** of `rustc` before building (for 
 
 ## <a name="what-it-looks-like"> What it looks like </a>
 
-<img alt="Redox" height="150" src="https://raw.githubusercontent.com/redox-os/redox/master/img/screenshots/Desktop.png">
-<img alt="Redox" height="150" src="https://raw.githubusercontent.com/redox-os/redox/master/img/screenshots/Fancy_opacity.png">
-<img alt="Redox" height="150" src="https://raw.githubusercontent.com/redox-os/redox/master/img/screenshots/File_manager.png">
+<img alt="Redox" height="150" src="https://github.com/redox-os/assets/raw/master/screenshots/Desktop.png">
+<img alt="Redox" height="150" src="https://github.com/redox-os/assets/raw/master/screenshots/Fancy_opacity.png">
+<img alt="Redox" height="150" src="https://github.com/redox-os/assets/raw/master/screenshots/File_manager.png">
 
-<img alt="Redox" height="150" src="https://raw.githubusercontent.com/redox-os/redox/master/img/screenshots/Sodium_v1.png">
-<img alt="Redox" height="150" src="https://raw.githubusercontent.com/redox-os/redox/master/img/screenshots/Boot.png">
-<img alt="Redox" height="150" src="https://raw.githubusercontent.com/redox-os/redox/master/img/screenshots/start.png">
+<img alt="Redox" height="150" src="https://github.com/redox-os/assets/raw/master/screenshots/Sodium_v1.png">
+<img alt="Redox" height="150" src="https://github.com/redox-os/assets/raw/master/screenshots/Boot.png">
+<img alt="Redox" height="150" src="https://github.com/redox-os/assets/raw/master/screenshots/start.png">
 
 ## <a name="compile-help"> Help! Redox won't compile! </a>
 
@@ -35,7 +35,7 @@ Sometimes things go wrong when compiling. Try the following before opening an is
 
 1. Run `make clean`.
 2. Run `git clean -X -f -d`.
-3. Make sure you have **the latest version of Rust nightly!** ([multirust](https://github.com/brson/multirust) is recommended for managing Rust versions).
+3. Make sure you have **the latest version of Rust nightly!** ([rustup.rs](https://www.rustup.rs) is recommended for managing Rust versions).
 4. Update **GNU Make**, **NASM** and **QEMU/VirtualBox**.
 5. Pull the upstream master branch (`git remote add upstream git@github.com:redox-os/redox.git; git pull upstream master`).
 6. Update submodules (`git submodule update --recursive --init`).
@@ -69,7 +69,7 @@ $ make qemu kvm=no
 
 #### QEMU with KVM
 
-To use QEMU with KVM (kernel-based virtual Machine), which is faster than without KVM, you need a CPU with Intel® Virtualization Technology (Intel® VT) or AMD Virtualization™ (AMD-V™) support. Most systems have this disabled in the BIOS by default, so you may need to reboot and enable the feature in the BIOS. 
+To use QEMU with KVM (kernel-based virtual Machine), which is faster than without KVM, you need a CPU with Intel® Virtualization Technology (Intel® VT) or AMD Virtualization™ (AMD-V™) support. Most systems have this disabled in the BIOS by default, so you may need to reboot and enable the feature in the BIOS.
 
 ### <a name="manual-setup"> Manual Setup </a>
 
@@ -87,11 +87,11 @@ $ cd redox/
 # Install/update dependencies
 $ sudo <your package manager> install make nasm qemu libfuse-dev
 
-# Install multirust
-$ curl -sf https://raw.githubusercontent.com/brson/multirust/master/quick-install.sh | sh
+# Install rustup.rs
+$ curl https://sh.rustup.rs -sSf | sh
 
 # Set override toolchain to nightly build
-$ multirust override nightly
+$ rustup override set nightly
 
 # For successive builds start here. If this is your first build, just continue
 
